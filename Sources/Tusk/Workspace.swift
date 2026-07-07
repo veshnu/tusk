@@ -7,14 +7,23 @@ struct Workspace: View {
     @Environment(\.palette) var pal
 
     @AppStorage("tusk.railWidth") private var railWidth: Double = 250
+    @AppStorage("tusk.terminalHeight") private var terminalHeight: Double = 300
 
     var body: some View {
         VStack(spacing: 0) {
             TitleBar()
             HStack(spacing: 0) {
                 SchemaSidebar()
-                CenterPane()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 0) {
+                    CenterPane()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if model.showTerminal {
+                        TerminalResizeBar(height: $terminalHeight, range: 140...640)
+                        ClaudeTerminalPanel()
+                            .frame(height: CGFloat(terminalHeight))
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 ResizeHandle(width: $railWidth, range: 200...520)
                 InfoRail(width: CGFloat(railWidth))
             }
@@ -83,6 +92,31 @@ private struct TitleBar: View {
             }
 
             Spacer()
+
+            // Claude Code terminal toggle
+            Button {
+                model.toggleTerminal()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "asterisk")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(model.showTerminal ? pal.accent : pal.textMuted)
+                    Text("Claude Code")
+                        .font(.ui(12))
+                        .foregroundColor(model.showTerminal ? pal.accent : pal.textSecondary)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
+                        .fill(model.showTerminal ? pal.accent.opacity(0.12) : pal.surfaceCard)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
+                        .strokeBorder(model.showTerminal ? pal.accent.opacity(0.35) : pal.borderDefault, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
 
             // Connection switcher / disconnect
             Menu {

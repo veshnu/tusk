@@ -41,6 +41,12 @@ final class AppModel: ObservableObject {
     @Published var connectionStatus: String = "connecting"
     private var healthTask: Task<Void, Never>?
 
+    // Embedded Claude Code terminal (bottom-docked panel).
+    @Published var showTerminal = false
+    let terminal = TerminalController()
+
+    func toggleTerminal() { showTerminal.toggle() }
+
     // Transient UI state
     @Published var connecting = false
     @Published var connectError: String?
