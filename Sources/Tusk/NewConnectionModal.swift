@@ -1,4 +1,5 @@
 import SwiftUI
+import TuskCore
 
 struct NewConnectionModal: View {
     @EnvironmentObject var model: AppModel

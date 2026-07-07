@@ -3,6 +3,9 @@
 .swiftpm/
 Package.resolved
 
+# Build/install output
+dist/
+
 # Xcode
 *.xcodeproj/
 xcuserdata/

@@ -7,12 +7,6 @@ struct TuskApp: App {
     @StateObject private var model = AppModel()
     @StateObject private var store = ConnectionStore()
 
-    init() {
-        if CommandLine.arguments.contains("--selfcheck") {
-            SelfCheck.run()
-        }
-    }
-
     var body: some Scene {
         Window("Tusk", id: "main") {
             RootView()

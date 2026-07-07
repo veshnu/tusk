@@ -1,4 +1,5 @@
 import SwiftUI
+import TuskCore
 
 struct Workspace: View {
     @EnvironmentObject var model: AppModel

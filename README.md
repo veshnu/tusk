@@ -46,7 +46,7 @@ Tusk is early and moving fast. Here's the honest picture:
 | Column detail with PK / FK / NOT NULL flags | ✅ Working |
 | Connection manager, light/dark themes | ✅ Working |
 | Direct `libpq` connection (no ORM, no server) | ✅ Working |
-| **MCP server (`tusk --mcp`)** | 🚧 Next up |
+| **MCP server (`tusk mcp`)** | 🚧 Next up |
 | Read query execution + result grid | 🚧 Planned |
 | Guarded writes / migrations with human approval | 🗺️ Roadmap |
 | MySQL, SQLite, and other engines | 🗺️ Roadmap |
@@ -67,14 +67,14 @@ project exists and is the immediate focus — see the [Roadmap](#roadmap).
   from `pg_catalog`.
 - **Saved connections** with per-connection SSL mode and environment tags; passwords go to
   the macOS Keychain, never to disk in plaintext.
-- **Headless self-check** (`tusk --selfcheck`) that exercises the entire connect → snapshot
+- **Headless self-check** (`tusk selfcheck`) that exercises the entire connect → snapshot
   → columns path against a live database — handy for CI and for verifying an environment.
 
 ---
 
 ## The MCP vision
 
-Once `tusk --mcp` lands, adding Tusk to Claude Code will be a one-liner:
+Once `tusk mcp` lands, adding Tusk to Claude Code will be a one-liner:
 
 ```jsonc
 // ~/.claude/mcp.json (illustrative — API not final)
@@ -82,7 +82,7 @@ Once `tusk --mcp` lands, adding Tusk to Claude Code will be a one-liner:
   "mcpServers": {
     "tusk": {
       "command": "tusk",
-      "args": ["--mcp", "--connection", "llamacloud"]
+      "args": ["mcp", "--connection", "llamacloud"]
     }
   }
 }
@@ -123,31 +123,59 @@ Install `libpq` via Homebrew:
 brew install libpq
 ```
 
-`Package.swift` expects Apple-Silicon Homebrew paths
-(`/opt/homebrew/opt/libpq`). On Intel Macs, adjust the `libpqInclude` / `libpqLib`
-constants at the top of `Package.swift` to your `brew --prefix libpq` location.
+### Install (both the app and the CLI)
 
-### Build & run
+Tusk ships as two pieces from one repo: the **GUI app** (`Tusk.app`) and a tiny
+**`tusk` CLI** that Claude Code spawns for MCP. Both install together.
+
+Once there's a signed release, the one-liner will be a Homebrew **cask** (a single cask
+installs the app *and* puts `tusk` on `PATH`):
+
+```bash
+brew tap veshnu/tusk
+brew install --cask tusk     # installs Tusk.app + the `tusk` CLI
+```
+
+To build and install from source today:
 
 ```bash
 git clone <this-repo> tusk
 cd tusk
-swift build          # compile
-swift run Tusk       # launch the app
+brew install libpq
+make install                 # → /Applications/Tusk.app  +  tusk on PATH
+```
+
+Other Makefile targets: `make` (build + assemble `dist/Tusk.app` and `dist/tusk` without
+installing), `make dist` (zip a release artifact), `make uninstall`, `make clean`.
+
+For a plain dev run without installing: `swift run Tusk` launches the app,
+`swift run tuskcli <command>` runs the CLI.
+
+### The `tusk` CLI
+
+```
+tusk mcp         start the MCP server over stdio (for Claude Code & other MCP clients)
+tusk selfcheck   verify the libpq path against a live Postgres (reads PG* env vars)
+tusk doctor      check the local environment (libpq, app install)
+tusk version
 ```
 
 ### Verify a connection headlessly
 
-The self-check connects, snapshots the schema, and reads a table's columns — all without
+`tusk selfcheck` connects, enumerates databases, and snapshots the schema — all without
 opening a window. It reads standard `PG*` environment variables:
 
 ```bash
 PGHOST=localhost PGPORT=5432 PGDATABASE=app_dev \
 PGUSER=postgres PGPASSWORD=secret \
-swift run Tusk --selfcheck
+tusk selfcheck
 ```
 
 A healthy run ends with `SELFCHECK_OK`.
+
+> **Note on Homebrew paths.** `Package.swift` expects Apple-Silicon Homebrew
+> (`/opt/homebrew/opt/libpq`). On Intel Macs, adjust the `libpqInclude` / `libpqLib`
+> constants at the top of `Package.swift` to your `brew --prefix libpq` location.
 
 ---
 
@@ -155,21 +183,25 @@ A healthy run ends with `SELFCHECK_OK`.
 
 ```
 Sources/
-├── CPostgres/            # system-library shim exposing libpq to Swift
-└── Tusk/
-    ├── TuskApp.swift          # @main app entry, window + routing
-    ├── AppModel.swift         # observable app state (connections, schema, selection)
-    ├── PostgresService.swift  # Database actor — one libpq connection per database
-    ├── Models.swift           # Connection, Relation, ColumnInfo, DBObjectKind
-    ├── Persistence.swift      # saved connections + Keychain
-    ├── ConnectScreen.swift    # connection picker
-    ├── Workspace.swift        # explorer tree, table detail, info rail
-    ├── NewConnectionModal.swift
-    ├── Components.swift        # buttons, fields, badges
-    ├── Theme.swift            # palette, light/dark
-    └── SelfCheck.swift        # headless `--selfcheck` harness
+├── CPostgres/                # system-library shim exposing libpq to Swift
+├── TuskCore/                 # shared, GUI-free core (linked by both app and CLI)
+│   ├── Models.swift          #   Connection, Relation, ColumnInfo, DBObjectKind
+│   └── PostgresService.swift #   Database actor — one libpq connection per database
+├── Tusk/                     # GUI app (SwiftUI/AppKit) → Tusk.app
+│   ├── TuskApp.swift         #   @main app entry, window + routing
+│   ├── AppModel.swift        #   observable app state (connections, schema, selection)
+│   ├── Persistence.swift     #   saved connections + Keychain
+│   ├── ConnectScreen.swift   #   connection picker
+│   ├── Workspace.swift       #   explorer tree, table detail, info rail
+│   ├── NewConnectionModal.swift
+│   ├── Components.swift      #   buttons, fields, badges
+│   └── Theme.swift           #   palette, light/dark
+└── tuskcli/                  # tiny CLI → installed as `tusk` (mcp / selfcheck / doctor)
+    └── main.swift
 ```
 
+- **`TuskCore` is GUI-free**, so the `tusk` CLI links it without dragging in
+  SwiftUI/AppKit — the CLI stays small and fast to spawn (which matters for `tusk mcp`).
 - **`Database` is a Swift `actor`** that owns the `libpq` handles. Because a Postgres
   connection is bound to a single database, Tusk keeps **one connection per database**,
   cloned from the base config, and opens them on demand. This is exactly the boundary the
@@ -177,11 +209,15 @@ Sources/
 - **`AppModel`** is the single source of truth the SwiftUI views observe. The MCP tools and
   the GUI will read the same model, which is what makes the two halves stay in sync.
 
+> The GUI build product is `Tusk` and the CLI build product is `tuskcli` (installed as
+> `tusk`) — named apart on purpose, since macOS's case-insensitive filesystem can't hold
+> both `Tusk` and `tusk` binaries in the same build directory.
+
 ---
 
 ## Roadmap
 
-- [ ] **`tusk --mcp`** — stdio MCP server exposing schema introspection + read queries
+- [ ] **`tusk mcp`** — stdio MCP server exposing schema introspection + read queries
 - [ ] Read query execution with a result grid in the GUI
 - [ ] Human-in-the-loop write/migration approval flow
 - [ ] Connection pooling / eviction for many-database servers

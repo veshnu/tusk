@@ -3,11 +3,11 @@ import CPostgres
 
 // MARK: - Errors & results
 
-enum PGError: LocalizedError {
+public enum PGError: LocalizedError {
     case message(String)
     case notConnected
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .message(let m): return m
         case .notConnected: return "Not connected"
@@ -15,14 +15,14 @@ enum PGError: LocalizedError {
     }
 }
 
-struct TestResult: Sendable {
-    let latencyMs: Double
-    let serverVersion: String
+public struct TestResult: Sendable {
+    public let latencyMs: Double
+    public let serverVersion: String
 }
 
-struct DBSnapshot: Sendable {
-    let database: String
-    let relations: [Relation]
+public struct DBSnapshot: Sendable {
+    public let database: String
+    public let relations: [Relation]
 }
 
 private struct RawResult {
@@ -48,9 +48,9 @@ private extension String {
     var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }
 
-// MARK: - Database actor (one persistent libpq connection)
+// MARK: - Database actor (one persistent libpq connection per database)
 
-actor Database {
+public actor Database {
     /// The config the workspace was opened with. New per-database connections are
     /// cloned from this (same host/port/user/password), overriding only `dbname`.
     private var baseConfig: Connection?
@@ -58,16 +58,18 @@ actor Database {
     /// to a single database, so browsing another DB on the same server needs its own.
     private var conns: [String: OpaquePointer] = [:]
 
+    public init() {}
+
     // MARK: Connection lifecycle
 
     /// Open the persistent workspace connection. Throws with the server's message on failure.
-    func open(_ cfg: Connection) throws {
+    public func open(_ cfg: Connection) throws {
         close()
         baseConfig = cfg
         conns[cfg.database] = try Database.rawConnect(cfg)
     }
 
-    func close() {
+    public func close() {
         for (_, c) in conns { PQfinish(c) }
         conns.removeAll()
         baseConfig = nil
@@ -84,7 +86,7 @@ actor Database {
     }
 
     /// Test a config with an ephemeral connection; returns latency + server version.
-    func test(_ cfg: Connection) throws -> TestResult {
+    public func test(_ cfg: Connection) throws -> TestResult {
         let start = DispatchTime.now()
         let c = try Database.rawConnect(cfg)
         defer { PQfinish(c) }
@@ -100,7 +102,7 @@ actor Database {
     // MARK: Introspection
 
     /// All databases on the server the user is allowed to connect to (templates excluded).
-    func databases() throws -> [String] {
+    public func databases() throws -> [String] {
         guard let cfg = baseConfig else { throw PGError.notConnected }
         let conn = try connection(for: cfg.database)
         let sql = """
@@ -113,7 +115,7 @@ actor Database {
     }
 
     /// A snapshot of one database + all its user relations (tables/views/matviews/partitioned).
-    func snapshot(database: String) throws -> DBSnapshot {
+    public func snapshot(database: String) throws -> DBSnapshot {
         let conn = try connection(for: database)
         let sql = """
         SELECT n.nspname AS schema,
@@ -139,7 +141,7 @@ actor Database {
     }
 
     /// Columns for a specific relation, with primary/foreign key flags.
-    func columns(database: String, schema: String, table: String) throws -> [ColumnInfo] {
+    public func columns(database: String, schema: String, table: String) throws -> [ColumnInfo] {
         let conn = try connection(for: database)
         let sql = """
         SELECT a.attname AS name,

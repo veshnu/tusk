@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import TuskCore
 
 // MARK: - Keychain (password storage)
 

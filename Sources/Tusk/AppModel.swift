@@ -1,4 +1,5 @@
 import SwiftUI
+import TuskCore
 
 @MainActor
 final class AppModel: ObservableObject {

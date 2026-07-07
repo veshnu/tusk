@@ -1,4 +1,5 @@
 import SwiftUI
+import TuskCore
 
 struct ConnectScreen: View {
     @EnvironmentObject var model: AppModel
