@@ -15,6 +15,7 @@ struct TuskApp: App {
                 .environment(\.palette, model.palette)
                 .preferredColorScheme(model.isDark ? .dark : .light)
                 .frame(minWidth: 940, minHeight: 620)
+                .onAppear { model.connectionStore = store }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1320, height: 820)

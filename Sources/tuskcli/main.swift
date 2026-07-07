@@ -105,7 +105,7 @@ func runMCPServe() async {
         warn("tusk mcp --serve: could not connect using PG* env vars: \(error.localizedDescription)")
         exit(1)
     }
-    let server = MCPSocketServer(db: db, connection: cfg)
+    let server = MCPSocketServer(provider: EnvTuskProvider(db: db, connection: cfg))
     do {
         try server.start()
     } catch {
@@ -137,7 +137,7 @@ func runMCP() async {
         """)
         exit(1)
     }
-    await runStdioMCPSession(db: db, connection: cfg)
+    await runStdioMCPSession(provider: EnvTuskProvider(db: db, connection: cfg))
 }
 
 switch command {

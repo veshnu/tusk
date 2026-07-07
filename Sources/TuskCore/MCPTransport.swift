@@ -81,16 +81,14 @@ private func connectUnix(_ fd: Int32, _ path: String) -> Bool {
 /// `MCPSession`, all sharing the same live `Database` — so an agent sees exactly
 /// the connections the GUI has open.
 public final class MCPSocketServer: @unchecked Sendable {
-    private let db: Database
-    private let connection: Connection
+    private let provider: TuskStateProviding
     public let socketPath: String
 
     private var listenFD: Int32 = -1
     private var running = false
 
-    public init(db: Database, connection: Connection, socketPath: String = TuskPaths.mcpSocketPath) {
-        self.db = db
-        self.connection = connection
+    public init(provider: TuskStateProviding, socketPath: String = TuskPaths.mcpSocketPath) {
+        self.provider = provider
         self.socketPath = socketPath
     }
 
@@ -130,7 +128,7 @@ public final class MCPSocketServer: @unchecked Sendable {
     }
 
     private func serve(_ client: Int32) {
-        let session = MCPSession(db: db, base: connection)
+        let session = MCPSession(provider: provider)
         let reader = FDLineReader(client)
         while let line = reader.next() {
             if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
@@ -149,8 +147,8 @@ public final class MCPSocketServer: @unchecked Sendable {
 
 /// Run an MCP session over stdin/stdout. Used when no app socket is available,
 /// so `tusk mcp` still works standalone from PG* env vars.
-public func runStdioMCPSession(db: Database, connection: Connection) async {
-    let session = MCPSession(db: db, base: connection)
+public func runStdioMCPSession(provider: TuskStateProviding) async {
+    let session = MCPSession(provider: provider)
     let reader = FDLineReader(0)
     while let line = reader.next() {
         if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }

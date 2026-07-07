@@ -25,12 +25,6 @@ public struct DBSnapshot: Sendable {
     public let relations: [Relation]
 }
 
-public struct QueryResult: Sendable {
-    public let columns: [String]
-    public let rows: [[String?]]
-    public let truncated: Bool
-}
-
 private struct RawResult {
     let columns: [String]
     let rows: [[String?]]
@@ -175,25 +169,6 @@ public actor Database {
                 isPK: (row[3] == "t"),
                 isFK: (row[4] == "t")
             )
-        }
-    }
-
-    /// Execute a **read-only** query. The statement runs inside a `READ ONLY`
-    /// transaction with a statement timeout, so any attempted write is rejected by
-    /// Postgres itself (no fragile SQL parsing), and the transaction is always rolled back.
-    public func query(database: String, sql: String, maxRows: Int = 1000) throws -> QueryResult {
-        let conn = try connection(for: database)
-        _ = try Database.exec(conn, "BEGIN READ ONLY")
-        _ = try? Database.exec(conn, "SET LOCAL statement_timeout = 15000")
-        do {
-            let res = try Database.exec(conn, sql)
-            _ = try? Database.exec(conn, "ROLLBACK")
-            let truncated = res.rows.count > maxRows
-            let rows = truncated ? Array(res.rows.prefix(maxRows)) : res.rows
-            return QueryResult(columns: res.columns, rows: rows, truncated: truncated)
-        } catch {
-            _ = try? Database.exec(conn, "ROLLBACK")
-            throw error
         }
     }
 

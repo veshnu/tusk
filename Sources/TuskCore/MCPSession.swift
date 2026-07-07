@@ -18,16 +18,18 @@ public enum TuskPaths {
 
 // MARK: - Errors
 
-enum MCPError: LocalizedError {
+public enum MCPError: LocalizedError {
     case invalidArguments(String)
     case unknownTool(String)
-    case blocked(String)
+    case notFound(String)
+    case notConnected(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .invalidArguments(let m): return m
         case .unknownTool(let name): return "Unknown tool: \(name)"
-        case .blocked(let m): return m
+        case .notFound(let m): return "Not found: \(m)"
+        case .notConnected(let m): return m
         }
     }
 }
@@ -58,12 +60,10 @@ private func jsonText(_ obj: [String: Any]) -> String {
 /// feed it a request line, it returns the response line (or nil for notifications).
 /// Backed by a shared `Database` actor, so every session sees the same live connections.
 public actor MCPSession {
-    private let db: Database
-    private let base: Connection
+    private let provider: TuskStateProviding
 
-    public init(db: Database, base: Connection) {
-        self.db = db
-        self.base = base
+    public init(provider: TuskStateProviding) {
+        self.provider = provider
     }
 
     public static let serverName = "tusk"
@@ -113,62 +113,45 @@ public actor MCPSession {
     }
 
     private func runTool(name: String, args: [String: Any]) async throws -> String {
-        // Default the target database to the connection's own database.
-        let database = (args["database"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? base.database
+        func requiredString(_ key: String) throws -> String {
+            guard let v = (args[key] as? String), !v.isEmpty else {
+                throw MCPError.invalidArguments("`\(key)` is required")
+            }
+            return v
+        }
 
         switch name {
-        case "list_databases":
-            let dbs = try await db.databases()
-            return jsonText(["databases": dbs])
-
-        case "describe_schema":
-            let snap = try await db.snapshot(database: database)
-            let rels = snap.relations.map {
-                ["schema": $0.schema, "name": $0.name, "kind": $0.kind.rawValue, "estimatedRows": $0.estRows] as [String: Any]
+        case "list_connections":
+            let conns = await provider.listConnections()
+            let out = conns.map {
+                ["id": $0.id, "name": $0.name, "host": $0.host, "port": $0.port,
+                 "user": $0.user, "database": $0.database, "env": $0.env, "status": $0.status] as [String: Any]
             }
-            return jsonText(["database": database, "relations": rels])
+            return jsonText(["connections": out])
+
+        case "list_databases":
+            let connectionId = try requiredString("connection_id")
+            let dbs = try await provider.listDatabases(connectionId: connectionId)
+            let out = dbs.map { ["id": $0.id, "name": $0.name, "connectionId": $0.connectionId] as [String: Any] }
+            return jsonText(["databases": out])
+
+        case "list_tables":
+            let databaseId = try requiredString("database_id")
+            let tables = try await provider.listTables(databaseId: databaseId)
+            let out = tables.map { ["id": $0.id, "name": $0.name, "schema": $0.schema, "kind": $0.kind] as [String: Any] }
+            return jsonText(["tables": out])
 
         case "describe_table":
-            guard let schema = (args["schema"] as? String), !schema.isEmpty,
-                  let table = (args["table"] as? String), !table.isEmpty else {
-                throw MCPError.invalidArguments("`schema` and `table` are required")
-            }
-            let cols = try await db.columns(database: database, schema: schema, table: table)
+            let databaseId = try requiredString("database_id")
+            let tableId = try requiredString("table_id")
+            let cols = try await provider.describeTable(databaseId: databaseId, tableId: tableId)
             let out = cols.map {
                 ["name": $0.name, "type": $0.type, "notNull": $0.notNull, "primaryKey": $0.isPK, "foreignKey": $0.isFK] as [String: Any]
             }
-            return jsonText(["database": database, "schema": schema, "table": table, "columns": out])
-
-        case "run_query":
-            guard let sql = (args["sql"] as? String), !sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw MCPError.invalidArguments("`sql` is required")
-            }
-            try Self.guardCredentials(sql)
-            let qr = try await db.query(database: database, sql: sql)
-            var payload: [String: Any] = [
-                "database": database,
-                "columns": qr.columns,
-                "rowCount": qr.rows.count,
-                "rows": qr.rows.map { row in row.map { cell in cell.map { $0 as Any } ?? NSNull() } },
-            ]
-            if qr.truncated { payload["truncated"] = true }
-            return jsonText(payload)
+            return jsonText(["databaseId": databaseId, "tableId": tableId, "columns": out])
 
         default:
             throw MCPError.unknownTool(name)
-        }
-    }
-
-    /// Postgres catalogs/columns that hold credential material (password *hashes* — plaintext
-    /// is never stored). Postgres already restricts these to superusers, but we block them at
-    /// the MCP boundary too, so the agent surface can't pull credentials even on a superuser
-    /// connection. Defense-in-depth; the real boundary is connecting Tusk as a read-only role.
-    static let blockedIdentifiers = ["pg_authid", "pg_shadow", "rolpassword"]
-
-    static func guardCredentials(_ sql: String) throws {
-        let lowered = sql.lowercased()
-        for id in blockedIdentifiers where lowered.contains(id) {
-            throw MCPError.blocked("Blocked: `\(id)` holds credential data and is not readable through Tusk.")
         }
     }
 
@@ -176,16 +159,27 @@ public actor MCPSession {
 
     static let toolDefinitions: [[String: Any]] = [
         [
-            "name": "list_databases",
-            "description": "List all databases on the connected Postgres server.",
+            "name": "list_connections",
+            "description": "List all Postgres connections configured in Tusk, with their connection status.",
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
         [
-            "name": "describe_schema",
-            "description": "List tables, views, and other relations in a database (defaults to the connected database).",
+            "name": "list_databases",
+            "description": "List the databases Tusk knows for a connection. Returns Tusk's configured/known state; does not issue a fresh query to the server.",
             "inputSchema": [
                 "type": "object",
-                "properties": ["database": ["type": "string", "description": "Database name; defaults to the connected database."]],
+                "properties": ["connection_id": ["type": "string", "description": "A connection id from list_connections."]],
+                "required": ["connection_id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "list_tables",
+            "description": "List all tables and views in a database.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["database_id": ["type": "string", "description": "A database id from list_databases."]],
+                "required": ["database_id"],
                 "additionalProperties": false,
             ],
         ],
@@ -195,24 +189,10 @@ public actor MCPSession {
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "database": ["type": "string", "description": "Database name; defaults to the connected database."],
-                    "schema": ["type": "string", "description": "Schema name, e.g. public."],
-                    "table": ["type": "string", "description": "Table name."],
+                    "database_id": ["type": "string", "description": "A database id from list_databases."],
+                    "table_id": ["type": "string", "description": "A table id from list_tables (\"schema.table\")."],
                 ],
-                "required": ["schema", "table"],
-                "additionalProperties": false,
-            ],
-        ],
-        [
-            "name": "run_query",
-            "description": "Run a READ-ONLY SQL query and return the rows. Executes inside a read-only transaction — any write is rejected by Postgres. Results are capped at 1000 rows.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "database": ["type": "string", "description": "Database name; defaults to the connected database."],
-                    "sql": ["type": "string", "description": "A read-only SQL statement (SELECT/EXPLAIN/…)."],
-                ],
-                "required": ["sql"],
+                "required": ["database_id", "table_id"],
                 "additionalProperties": false,
             ],
         ],

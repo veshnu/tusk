@@ -34,6 +34,9 @@ final class AppModel: ObservableObject {
 
     let db = Database()
 
+    /// Set once at launch; lets the MCP provider enumerate all configured connections.
+    weak var connectionStore: ConnectionStore?
+
     /// MCP server hosting the live connection over the app's unix socket.
     private var mcpServer: MCPSocketServer?
 
@@ -112,8 +115,10 @@ final class AppModel: ObservableObject {
     // MARK: MCP server lifecycle
 
     private func startMCPServer(for conn: Connection) {
+        guard let store = connectionStore else { return }
         mcpServer?.stop()
-        let server = MCPSocketServer(db: db, connection: conn)
+        let provider = AppTuskProvider(model: self, store: store)
+        let server = MCPSocketServer(provider: provider)
         do {
             try server.start()
             mcpServer = server

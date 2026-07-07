@@ -46,14 +46,14 @@ Tusk is early and moving fast. Here's the honest picture:
 | Column detail with PK / FK / NOT NULL flags | ✅ Working |
 | Connection manager, light/dark themes | ✅ Working |
 | Direct `libpq` connection (no ORM, no server) | ✅ Working |
-| **MCP server** (`list_databases`, `describe_schema`, `describe_table`, read-only `run_query`) | ✅ Working (v0) |
+| **MCP server** (`list_connections`, `list_databases`, `list_tables`, `describe_table`) | ✅ Working (v0) |
 | Served over a dedicated unix socket; `tusk mcp` bridges Claude Code's stdio to it | ✅ Working |
-| In-GUI result grid for `run_query` | 🚧 Planned |
+| Read-only `run_query` tool | 🚧 Planned |
 | Guarded writes / migrations with human approval | 🗺️ Roadmap |
 | MySQL, SQLite, and other engines | 🗺️ Roadmap |
 
-The Postgres explorer and a **read-only MCP server** both work today. Writes-by-approval and
-a result grid are next — see the [Roadmap](#roadmap).
+The Postgres explorer and a **metadata MCP server** both work today. A read-only query tool
+and writes-by-approval are next — see the [Roadmap](#roadmap).
 
 ---
 
@@ -111,32 +111,32 @@ claude mcp add tusk --env PGHOST=localhost --env PGPORT=5432 \
 
 ### Tools exposed today
 
+The tools are a navigable view of Tusk's own state — connection → database → table → columns.
+IDs flow from one call into the next (`connection_id` → `database_id` → `table_id`).
+
 | Tool | Purpose |
 | --- | --- |
-| `list_databases` | Every database on the connected server |
-| `describe_schema` | Tables/views/relations in a database (defaults to the connected one) |
-| `describe_table` | A table's columns, types, and PK/FK/NOT NULL flags |
-| `run_query` | Execute a **read-only** SQL query; returns rows as structured JSON |
+| `list_connections` | All connections configured in Tusk, each with its status (`connected`/`disconnected`) |
+| `list_databases(connection_id)` | Databases Tusk knows for a connection — its cached/configured state, **no fresh server round-trip** |
+| `list_tables(database_id)` | All tables and views in a database |
+| `describe_table(database_id, table_id)` | A table's columns, types, and PK/FK/NOT NULL flags |
 
-**`run_query` is safe by construction:** every statement runs inside a `READ ONLY`
-transaction with a statement timeout, so a write is rejected by Postgres itself
-(*"cannot execute INSERT in a read-only transaction"*) — no fragile SQL parsing — and the
-transaction is always rolled back. Results are capped at 1000 rows.
+**Metadata only — no data, no SQL.** The server exposes schema and connection *structure*, not
+row data, and there is no arbitrary-query tool. So it can't return table contents, and it
+can't reach Postgres's credential catalogs. Plaintext passwords are never stored in Postgres,
+and no tool ever emits Tusk's own saved connection password. The security boundary for
+whatever *is* exposed is to connect Tusk as a **least-privilege, read-only role**.
 
-**No credentials leak through the tools.** Plaintext passwords are never stored in Postgres,
-and no tool ever emits Tusk's own saved connection password. As defense-in-depth, `run_query`
-also blocks the credential catalogs that hold password *hashes* (`pg_authid`, `pg_shadow`,
-`rolpassword`) even on a superuser connection. The real security boundary is still to connect
-Tusk as a **least-privilege, read-only role**.
+Tusk opens one connection at a time, so `list_tables`/`describe_table` apply to the
+**connected** connection; others list via `list_connections` but must be opened in the app
+before you can drill into them.
 
 ### Where it's heading
 
-- **Write by consent** — `propose_write` drafts an `INSERT`/`UPDATE`/migration that a human
-  approves in the GUI before it touches the database.
-- **Least privilege** — point the connection at a read-only role and it physically cannot do
-  more than read.
-- **Shared context** — because the server rides on the app's live connection, the agent's SQL
-  is grounded in your real schema, not a hallucinated one.
+- **A query tool, by consent** — a future `run_query` (read-only) and `propose_write` (writes
+  a human approves in the GUI) — deliberately *not* in this first cut.
+- **Shared context** — because the server rides on the app's live connections, what the agent
+  sees is exactly what's open in the GUI.
 
 ---
 
@@ -219,10 +219,12 @@ Sources/
 │   ├── Models.swift          #   Connection, Relation, ColumnInfo, DBObjectKind
 │   ├── PostgresService.swift #   Database actor — one libpq connection per database
 │   ├── MCPSession.swift      #   MCP JSON-RPC session + tool definitions
+│   ├── MCPProvider.swift     #   TuskStateProviding protocol + DTOs + headless provider
 │   └── MCPTransport.swift    #   unix-socket server, stdio session, stdio↔socket bridge
 ├── Tusk/                     # GUI app (SwiftUI/AppKit) → Tusk.app
 │   ├── TuskApp.swift         #   @main app entry, window + routing
 │   ├── AppModel.swift        #   observable app state (connections, schema, selection)
+│   ├── AppTuskProvider.swift #   MCP provider backed by live app state
 │   ├── Persistence.swift     #   saved connections + Keychain
 │   ├── ConnectScreen.swift   #   connection picker
 │   ├── Workspace.swift       #   explorer tree, table detail, info rail
@@ -251,9 +253,9 @@ Sources/
 
 ## Roadmap
 
-- [x] **MCP server** over a unix socket: `list_databases`, `describe_schema`,
-      `describe_table`, read-only `run_query`; `tusk mcp` bridges Claude Code's stdio to it
-- [ ] Result grid in the GUI for `run_query`
+- [x] **MCP server** over a unix socket: `list_connections`, `list_databases`, `list_tables`,
+      `describe_table`; `tusk mcp` bridges Claude Code's stdio to it
+- [ ] Read-only `run_query` tool (+ a result grid in the GUI)
 - [ ] Human-in-the-loop write/migration approval flow (`propose_write`)
 - [ ] Connection pooling / eviction for many-database servers
 - [ ] Query history and saved queries, shared between agent and human
