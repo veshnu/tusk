@@ -25,6 +25,16 @@ public struct DBSnapshot: Sendable {
     public let relations: [Relation]
 }
 
+/// A page of rows read from a relation (column names + string-encoded cells; NULL is nil).
+public struct RowSet: Sendable {
+    public let columns: [String]
+    public let rows: [[String?]]
+    public init(columns: [String], rows: [[String?]]) {
+        self.columns = columns
+        self.rows = rows
+    }
+}
+
 private struct RawResult {
     let columns: [String]
     let rows: [[String?]]
@@ -172,7 +182,20 @@ public actor Database {
         }
     }
 
+    /// A page of rows from a relation. Identifiers are quoted; `limit` caps the fetch.
+    public func rows(database: String, schema: String, table: String, limit: Int = 200) throws -> RowSet {
+        let conn = try connection(for: database)
+        let sql = "SELECT * FROM \(Database.quoteIdent(schema)).\(Database.quoteIdent(table)) LIMIT \(max(0, limit))"
+        let res = try Database.exec(conn, sql)
+        return RowSet(columns: res.columns, rows: res.rows)
+    }
+
     // MARK: - Raw libpq wrappers
+
+    /// Quote a SQL identifier so it can be interpolated safely (doubles embedded quotes).
+    private static func quoteIdent(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
 
     private static func rawConnect(_ cfg: Connection) throws -> OpaquePointer {
         var keywords: [String] = []

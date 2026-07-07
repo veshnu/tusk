@@ -26,11 +26,27 @@ final class AppModel: ObservableObject {
     @Published var loadingSchema = false
     @Published var schemaError: String?
 
-    // Selected relation in the workspace + its columns
+    /// What the right-hand inspector rail is describing. Driven by single-clicks in the tree.
+    enum Inspector: Equatable {
+        case server
+        case database(String)
+        case relation
+    }
+    @Published var inspector: Inspector = .server
+
+    // Selected relation in the workspace + its columns (shown in the inspector).
     @Published var selectedDatabase: String?
     @Published var selectedRelationID: String?      // "schema.name" within selectedDatabase
     @Published var columns: [ColumnInfo] = []
     @Published var loadingColumns = false
+
+    // Opened table data shown in the center pane (driven by double-click).
+    @Published var openedDatabase: String?
+    @Published var openedRelationID: String?
+    @Published var dataColumns: [String] = []
+    @Published var dataRows: [[String?]] = []
+    @Published var loadingData = false
+    @Published var dataError: String?
 
     let db = Database()
 
@@ -68,7 +84,7 @@ final class AppModel: ObservableObject {
                 databaseErrors = [:]
                 selectedDatabase = conn.database
                 route = .workspace
-                selectFirstRelation(in: conn.database)
+                selectServer()
                 startMCPServer(for: conn)
             } catch {
                 connectError = error.localizedDescription
@@ -145,18 +161,34 @@ final class AppModel: ObservableObject {
         columns = []
         selectedDatabase = nil
         selectedRelationID = nil
+        inspector = .server
+        openedDatabase = nil
+        openedRelationID = nil
+        dataColumns = []
+        dataRows = []
+        dataError = nil
         route = .connect
     }
 
-    // MARK: Relation selection
+    // MARK: Inspector selection (single-click)
 
-    private func selectFirstRelation(in database: String) {
-        if let first = snapshots[database]?.relations.first {
-            select(database: database, relation: first)
-        }
+    /// Single-click the server node: describe the connection in the inspector.
+    func selectServer() {
+        inspector = .server
+        selectedRelationID = nil
     }
 
+    /// Single-click a database node: describe the database (loading its snapshot for stats).
+    func selectDatabase(_ database: String) {
+        inspector = .database(database)
+        selectedDatabase = database
+        selectedRelationID = nil
+        loadDatabase(database)
+    }
+
+    /// Single-click a relation: describe it (its columns) in the inspector.
     func select(database: String, relation: Relation) {
+        inspector = .relation
         selectedDatabase = database
         selectedRelationID = relation.id
         loadingColumns = true
@@ -173,7 +205,31 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Table data (double-click)
+
+    /// Double-click a relation: select it *and* load a page of its rows into the center pane.
+    func openTable(database: String, relation: Relation) {
+        select(database: database, relation: relation)
+        openedDatabase = database
+        openedRelationID = relation.id
+        loadingData = true
+        dataError = nil
+        dataColumns = []
+        dataRows = []
+        let token = "\(database)|\(relation.id)"
+        Task {
+            do {
+                let set = try await db.rows(database: database, schema: relation.schema, table: relation.name, limit: 200)
+                if openToken == token { dataColumns = set.columns; dataRows = set.rows }
+            } catch {
+                if openToken == token { dataError = error.localizedDescription }
+            }
+            loadingData = false
+        }
+    }
+
     private var selectionToken: String { "\(selectedDatabase ?? "")|\(selectedRelationID ?? "")" }
+    private var openToken: String { "\(openedDatabase ?? "")|\(openedRelationID ?? "")" }
 
     var selectedSnapshot: DBSnapshot? {
         guard let d = selectedDatabase else { return nil }
@@ -182,5 +238,11 @@ final class AppModel: ObservableObject {
 
     var selectedRelation: Relation? {
         selectedSnapshot?.relations.first { $0.id == selectedRelationID }
+    }
+
+    /// The relation whose data is open in the center pane, if any.
+    var openedRelation: Relation? {
+        guard let d = openedDatabase, let id = openedRelationID else { return nil }
+        return snapshots[d]?.relations.first { $0.id == id }
     }
 }

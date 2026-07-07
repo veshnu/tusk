@@ -1,22 +1,64 @@
 import SwiftUI
+import AppKit
 import TuskCore
 
 struct Workspace: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    @AppStorage("tusk.railWidth") private var railWidth: Double = 250
+
     var body: some View {
         VStack(spacing: 0) {
             TitleBar()
             HStack(spacing: 0) {
                 SchemaSidebar()
-                TableDetail()
+                CenterPane()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                InfoRail()
+                ResizeHandle(width: $railWidth, range: 200...520)
+                InfoRail(width: CGFloat(railWidth))
             }
         }
         .background(pal.surfaceApp)
         .ignoresSafeArea(.container, edges: .top)
+    }
+}
+
+// MARK: - Draggable resize handle (grows the pane to its right)
+
+private struct ResizeHandle: View {
+    @Environment(\.palette) var pal
+    @Binding var width: Double
+    let range: ClosedRange<Double>
+
+    @State private var dragStartWidth: Double?
+    @State private var hovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: 7)
+            .overlay(
+                Rectangle()
+                    .fill(hovering ? pal.accent : pal.borderDefault)
+                    .frame(width: hovering ? 2 : 1)
+            )
+            .contentShape(Rectangle())
+            .onHover { inside in
+                hovering = inside
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        let base = dragStartWidth ?? width
+                        if dragStartWidth == nil { dragStartWidth = base }
+                        // Handle sits on the pane's left edge: dragging left widens it.
+                        let proposed = base - Double(value.translation.width)
+                        width = min(max(proposed, range.lowerBound), range.upperBound)
+                    }
+                    .onEnded { _ in dragStartWidth = nil }
+            )
     }
 }
 
@@ -152,9 +194,11 @@ private struct SchemaSidebar: View {
                     } else {
                         // Server node (user@host)
                         TreeRow(depth: 0, icon: "server.rack", label: model.serverLabel,
-                                trailing: nil, selected: false, expandable: true, expanded: !serverCollapsed) {
-                            serverCollapsed.toggle()
-                        } onSelect: { serverCollapsed.toggle() }
+                                trailing: nil, selected: model.inspector == .server,
+                                expandable: true, expanded: !serverCollapsed,
+                                onToggle: { serverCollapsed.toggle() },
+                                onSelect: { model.selectServer() },
+                                onOpen: { serverCollapsed.toggle() })
 
                         if !serverCollapsed {
                             ForEach(model.databases, id: \.self) { dbName in
@@ -195,10 +239,11 @@ private struct SchemaSidebar: View {
         let isActive = dbName == model.activeConn?.database
 
         TreeRow(depth: 1, icon: "cylinder.split.1x2", label: dbName,
-                trailing: nil, selected: false, expandable: true, expanded: dbExpanded,
-                muted: !isActive) {
-            model.toggleDatabase(dbName)
-        } onSelect: { model.toggleDatabase(dbName) }
+                trailing: nil, selected: model.inspector == .database(dbName),
+                expandable: true, expanded: dbExpanded, muted: !isActive,
+                onToggle: { model.toggleDatabase(dbName) },
+                onSelect: { model.selectDatabase(dbName) },
+                onOpen: { model.toggleDatabase(dbName) })
 
         if dbExpanded {
             if model.loadingDatabases.contains(dbName) {
@@ -218,9 +263,10 @@ private struct SchemaSidebar: View {
                     let expanded = !collapsedSchemas.contains(key)
                     TreeRow(depth: 2, icon: "shippingbox", label: group.schema,
                             trailing: "\(group.relations.count)", selected: false,
-                            expandable: true, expanded: expanded) {
-                        toggleSchema(key)
-                    } onSelect: { toggleSchema(key) }
+                            expandable: true, expanded: expanded,
+                            onToggle: { toggleSchema(key) },
+                            onSelect: { model.selectDatabase(dbName) },
+                            onOpen: { toggleSchema(key) })
 
                     if expanded {
                         ForEach(group.relations) { rel in
@@ -228,10 +274,10 @@ private struct SchemaSidebar: View {
                                     trailing: (rel.kind == .table || rel.kind == .partitioned) ? Fmt.rows(rel.estRows) : nil,
                                     selected: model.selectedDatabase == dbName && model.selectedRelationID == rel.id,
                                     expandable: false, expanded: false,
-                                    muted: rel.kind == .function) {
-                            } onSelect: {
-                                model.select(database: dbName, relation: rel)
-                            }
+                                    muted: rel.kind == .function,
+                                    onToggle: {},
+                                    onSelect: { model.select(database: dbName, relation: rel) },
+                                    onOpen: { model.openTable(database: dbName, relation: rel) })
                         }
                     }
                 }
@@ -290,6 +336,7 @@ private struct TreeRow: View {
     var muted: Bool = false
     let onToggle: () -> Void
     let onSelect: () -> Void
+    var onOpen: () -> Void = {}
 
     @State private var hovering = false
 
@@ -338,35 +385,41 @@ private struct TreeRow: View {
                 .padding(.horizontal, 4)
         )
         .contentShape(Rectangle())
-        .onTapGesture(perform: onSelect)
+        .onTapGesture(count: 2, perform: onOpen)
+        .onTapGesture(count: 1, perform: onSelect)
         .onHover { hovering = $0 }
     }
 }
 
-// MARK: - Center: table detail
+// MARK: - Center: welcome / table data
 
-private struct TableDetail: View {
+private struct CenterPane: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    private let cellWidth: CGFloat = 180
+
     var body: some View {
         VStack(spacing: 0) {
-            if let rel = model.selectedRelation {
+            if let rel = model.openedRelation {
                 header(rel)
-                columnsHeader
                 Divider().overlay(pal.borderSubtle)
-                if model.loadingColumns {
-                    center { ProgressView().controlSize(.small); Text("Loading columns…").font(.ui(13)).foregroundColor(pal.textMuted) }
-                } else if model.columns.isEmpty {
+                if model.loadingData {
+                    center { ProgressView().controlSize(.small); Text("Loading data…").font(.ui(13)).foregroundColor(pal.textMuted) }
+                } else if let err = model.dataError {
+                    center { Image(systemName: "exclamationmark.triangle").font(.system(size: 22)).foregroundColor(pal.danger)
+                             Text(err).font(.mono(12)).foregroundColor(pal.danger).multilineTextAlignment(.center) }
+                } else if model.dataColumns.isEmpty {
                     center { Image(systemName: "tablecells").font(.system(size: 22)).foregroundColor(pal.textFaint)
-                             Text("No columns").font(.ui(13)).foregroundColor(pal.textMuted) }
+                             Text("No rows").font(.ui(13)).foregroundColor(pal.textMuted) }
                 } else {
-                    columnList
+                    dataGrid
                 }
             } else {
-                emptyState
+                welcome
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(pal.surfaceRaised)
     }
 
@@ -380,10 +433,10 @@ private struct TableDetail: View {
             Text(rel.name).font(.ui(15, weight: .semibold)).foregroundColor(pal.textPrimary)
             Badge(text: kindLabel(rel.kind), color: pal.textMuted)
             Spacer()
-            if rel.kind == .table || rel.kind == .partitioned {
-                Badge(text: "~\(Fmt.rows(rel.estRows)) rows", color: pal.textMuted, mono: true)
+            if !model.dataColumns.isEmpty {
+                Badge(text: "\(model.dataRows.count) rows", color: pal.textMuted, mono: true)
             }
-            Button { model.refreshSchema() } label: {
+            Button { reload(rel) } label: {
                 Image(systemName: "arrow.clockwise").font(.system(size: 13)).foregroundColor(pal.textMuted)
                     .frame(width: 28, height: 26)
             }.buttonStyle(.plain)
@@ -394,49 +447,85 @@ private struct TableDetail: View {
         .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
     }
 
-    private var columnsHeader: some View {
-        HStack {
-            Text("COLUMNS")
-                .font(.ui(10, weight: .semibold)).tracking(0.6)
-                .foregroundColor(pal.textFaint)
-            Spacer()
-            Text("\(model.columns.count)")
-                .font(.mono(11)).foregroundColor(pal.textFaint)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
+    private func reload(_ rel: Relation) {
+        if let db = model.openedDatabase { model.openTable(database: db, relation: rel) }
     }
 
-    private var columnList: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(Array(model.columns.enumerated()), id: \.element.id) { idx, col in
-                    ColumnRow(col: col, zebra: idx % 2 == 1)
+    private var dataGrid: some View {
+        ScrollView([.horizontal, .vertical]) {
+            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                Section(header: gridHeaderRow) {
+                    ForEach(Array(model.dataRows.enumerated()), id: \.offset) { idx, row in
+                        gridRow(row, zebra: idx % 2 == 1)
+                    }
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 12)
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "cylinder.split.1x2")
-                .font(.system(size: 30))
-                .foregroundColor(pal.textFaint)
-            Text("Select a table")
-                .font(.ui(15, weight: .medium))
-                .foregroundColor(pal.textSecondary)
-            Text("Pick an object from the explorer to see its columns.")
-                .font(.ui(12))
-                .foregroundColor(pal.textMuted)
+    private var gridHeaderRow: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(model.dataColumns.enumerated()), id: \.offset) { _, name in
+                Text(name)
+                    .font(.mono(11, weight: .semibold))
+                    .foregroundColor(pal.textMuted)
+                    .lineLimit(1)
+                    .padding(.horizontal, 10)
+                    .frame(width: cellWidth, height: 30, alignment: .leading)
+                    .overlay(Divider().overlay(pal.borderSubtle), alignment: .trailing)
+            }
+        }
+        .background(pal.surfacePanel)
+        .overlay(Divider().overlay(pal.borderDefault), alignment: .bottom)
+    }
+
+    private func gridRow(_ row: [String?], zebra: Bool) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(row.enumerated()), id: \.offset) { _, value in
+                Group {
+                    if let value {
+                        Text(value)
+                            .font(.mono(11.5))
+                            .foregroundColor(pal.textPrimary)
+                    } else {
+                        Text("NULL")
+                            .font(.mono(11))
+                            .foregroundColor(pal.textFaint)
+                            .italic()
+                    }
+                }
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, 10)
+                .frame(width: cellWidth, height: 28, alignment: .leading)
+                .overlay(Divider().overlay(pal.borderSubtle), alignment: .trailing)
+            }
+        }
+        .background(zebra ? pal.surfaceHover.opacity(0.5) : .clear)
+        .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "hexagon.fill")
+                .font(.system(size: 34))
+                .foregroundColor(pal.accent)
+            Text("Welcome to Tusk")
+                .font(.ui(17, weight: .semibold))
+                .foregroundColor(pal.textPrimary)
+            VStack(spacing: 4) {
+                Text("Single-click an object in the explorer to inspect it.")
+                Text("Double-click a table to load its data here.")
+            }
+            .font(.ui(12.5))
+            .foregroundColor(pal.textMuted)
+            .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func center<C: View>(@ViewBuilder _ content: () -> C) -> some View {
-        HStack(spacing: 10) { content() }
+        VStack(spacing: 10) { content() }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -493,62 +582,159 @@ private struct ColumnRow: View {
     }
 }
 
-// MARK: - Right info rail
+// MARK: - Right info rail (selection-driven inspector)
 
 private struct InfoRail: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
-    private var schemaCount: Int {
-        Set(model.selectedSnapshot?.relations.map { $0.schema } ?? []).count
-    }
-    private var viewCount: Int {
-        model.selectedSnapshot?.relations.filter { $0.kind == .view || $0.kind == .matview }.count ?? 0
-    }
-    private var tableCount: Int {
-        model.selectedSnapshot?.relations.filter { $0.kind == .table || $0.kind == .partitioned }.count ?? 0
-    }
+    let width: CGFloat
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "bolt.horizontal.circle").font(.system(size: 14)).foregroundColor(pal.textMuted)
-                Text("Connection").font(.ui(13, weight: .semibold)).foregroundColor(pal.textPrimary)
-                Spacer()
-                StatusDot(status: "connected", size: 7)
+        Group {
+            switch model.inspector {
+            case .server:              connectionInspector
+            case .database(let name):  databaseInspector(name)
+            case .relation:            tableInspector
             }
-            .padding(.horizontal, 14)
-            .frame(height: Metrics.toolbarHeight)
-            .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+        }
+        .frame(width: width)
+        .background(pal.surfacePanel)
+    }
 
+    // MARK: Connection
+
+    private var connectionInspector: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            railHeader("bolt.horizontal.circle", "Connection")
             VStack(alignment: .leading, spacing: 10) {
                 infoRow("Name", model.activeConn?.name ?? "—", mono: false)
                 infoRow("Host", model.activeConn?.hostPort ?? "—")
-                infoRow("Database", model.selectedDatabase ?? "—")
                 infoRow("User", model.activeConn?.user ?? "—")
                 infoRow("SSL", model.activeConn?.sslMode ?? "—")
             }
             .padding(14)
-
-            Text("OVERVIEW")
-                .font(.ui(10, weight: .semibold)).tracking(0.6)
-                .foregroundColor(pal.textFaint)
-                .padding(.horizontal, 14)
-                .padding(.top, 4)
-                .padding(.bottom, 8)
-
+            sectionLabel("SERVER")
             HStack(spacing: 8) {
-                stat("\(schemaCount)", "schemas")
-                stat("\(tableCount)", "tables")
-                stat("\(viewCount)", "views")
+                stat("\(model.databases.count)", "databases")
             }
             .padding(.horizontal, 14)
-
             Spacer()
         }
-        .frame(width: 250)
-        .background(pal.surfacePanel)
-        .overlay(Divider().overlay(pal.borderDefault), alignment: .leading)
+    }
+
+    // MARK: Database
+
+    private func databaseInspector(_ name: String) -> some View {
+        let snap = model.snapshots[name]
+        return VStack(alignment: .leading, spacing: 0) {
+            railHeader("cylinder.split.1x2", "Database")
+            VStack(alignment: .leading, spacing: 10) {
+                infoRow("Name", name)
+                infoRow("Server", model.activeConn?.hostPort ?? "—")
+            }
+            .padding(14)
+            sectionLabel("OVERVIEW")
+            if snap == nil && model.loadingDatabases.contains(name) {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                    Text("Loading…").font(.ui(12)).foregroundColor(pal.textMuted)
+                }
+                .padding(.horizontal, 14)
+            } else {
+                HStack(spacing: 8) {
+                    stat("\(schemaCount(snap))", "schemas")
+                    stat("\(tableCount(snap))", "tables")
+                    stat("\(viewCount(snap))", "views")
+                }
+                .padding(.horizontal, 14)
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: Table
+
+    private var tableInspector: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            railHeader("tablecells", "Table")
+            if let rel = model.selectedRelation {
+                VStack(alignment: .leading, spacing: 10) {
+                    infoRow("Schema", rel.schema)
+                    infoRow("Name", rel.name)
+                    if rel.kind == .table || rel.kind == .partitioned {
+                        infoRow("Est. rows", "~\(Fmt.rows(rel.estRows))")
+                    }
+                }
+                .padding(14)
+            }
+            HStack {
+                Text("COLUMNS")
+                    .font(.ui(10, weight: .semibold)).tracking(0.6)
+                    .foregroundColor(pal.textFaint)
+                Spacer()
+                Text("\(model.columns.count)")
+                    .font(.mono(11)).foregroundColor(pal.textFaint)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
+
+            if model.loadingColumns {
+                inlineNote { ProgressView().controlSize(.small).scaleEffect(0.7)
+                             Text("Loading columns…").font(.ui(12)).foregroundColor(pal.textMuted) }
+            } else if model.columns.isEmpty {
+                inlineNote { Text("No columns").font(.ui(12)).foregroundColor(pal.textMuted) }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(model.columns.enumerated()), id: \.element.id) { idx, col in
+                            ColumnRow(col: col, zebra: idx % 2 == 1)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 12)
+                }
+            }
+        }
+    }
+
+    // MARK: Building blocks
+
+    private func railHeader(_ icon: String, _ title: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: 14)).foregroundColor(pal.textMuted)
+            Text(title).font(.ui(13, weight: .semibold)).foregroundColor(pal.textPrimary)
+            Spacer()
+            StatusDot(status: "connected", size: 7)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: Metrics.toolbarHeight)
+        .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+    }
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.ui(10, weight: .semibold)).tracking(0.6)
+            .foregroundColor(pal.textFaint)
+            .padding(.horizontal, 14)
+            .padding(.top, 4)
+            .padding(.bottom, 8)
+    }
+
+    @ViewBuilder private func inlineNote<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        HStack(spacing: 8) { content() }
+            .padding(.horizontal, 14)
+        Spacer()
+    }
+
+    private func schemaCount(_ snap: DBSnapshot?) -> Int {
+        Set(snap?.relations.map { $0.schema } ?? []).count
+    }
+    private func tableCount(_ snap: DBSnapshot?) -> Int {
+        snap?.relations.filter { $0.kind == .table || $0.kind == .partitioned }.count ?? 0
+    }
+    private func viewCount(_ snap: DBSnapshot?) -> Int {
+        snap?.relations.filter { $0.kind == .view || $0.kind == .matview }.count ?? 0
     }
 
     private func infoRow(_ label: String, _ value: String, mono: Bool = true) -> some View {
