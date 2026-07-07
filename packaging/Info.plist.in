@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>Tusk</string>
 	<key>CFBundleIdentifier</key>
-	<string>ai.runllama.tusk</string>
+	<string>com.veshnu.Tusk</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

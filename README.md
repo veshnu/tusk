@@ -46,13 +46,14 @@ Tusk is early and moving fast. Here's the honest picture:
 | Column detail with PK / FK / NOT NULL flags | ✅ Working |
 | Connection manager, light/dark themes | ✅ Working |
 | Direct `libpq` connection (no ORM, no server) | ✅ Working |
-| **MCP server (`tusk mcp`)** | 🚧 Next up |
-| Read query execution + result grid | 🚧 Planned |
+| **MCP server** (`list_databases`, `describe_schema`, `describe_table`, read-only `run_query`) | ✅ Working (v0) |
+| Served over a dedicated unix socket; `tusk mcp` bridges Claude Code's stdio to it | ✅ Working |
+| In-GUI result grid for `run_query` | 🚧 Planned |
 | Guarded writes / migrations with human approval | 🗺️ Roadmap |
 | MySQL, SQLite, and other engines | 🗺️ Roadmap |
 
-Today it's the **best-in-class Postgres explorer** half. The MCP half is the reason the
-project exists and is the immediate focus — see the [Roadmap](#roadmap).
+The Postgres explorer and a **read-only MCP server** both work today. Writes-by-approval and
+a result grid are next — see the [Roadmap](#roadmap).
 
 ---
 
@@ -72,40 +73,64 @@ project exists and is the immediate focus — see the [Roadmap](#roadmap).
 
 ---
 
-## The MCP vision
+## MCP: drive your database from Claude Code
 
-Once `tusk mcp` lands, adding Tusk to Claude Code will be a one-liner:
+### How it connects (no ports)
 
-```jsonc
-// ~/.claude/mcp.json (illustrative — API not final)
-{
-  "mcpServers": {
-    "tusk": {
-      "command": "tusk",
-      "args": ["mcp", "--connection", "llamacloud"]
-    }
-  }
-}
+When you open a connection in the Tusk app, it hosts an MCP server on a **dedicated unix
+socket** — Tusk's equivalent of `/var/run/docker.sock`:
+
+```
+~/Library/Application Support/Tusk/mcp.sock
 ```
 
-Planned tools the server will expose to the agent:
+`tusk mcp` is a tiny bridge Claude Code spawns over **stdio**; it relays that stdio to the
+socket. So there's **no TCP port** to collide with anything, and the agent talks to the same
+live connection you have open in the GUI.
+
+```
+Claude Code ──stdio──▶ tusk mcp ──unix socket──▶ Tusk.app ──▶ Postgres
+```
+
+### Add it to Claude Code
+
+```bash
+claude mcp add tusk -- tusk mcp
+```
+
+Then, in the app, connect to a database — and ask Claude Code things like
+*"what columns does public.orders have?"* or *"count rows per status in orders"*.
+
+If the app isn't running, `tusk mcp` falls back to serving directly over stdio using
+standard `PG*` environment variables, so it still works headless (e.g. in CI):
+
+```bash
+claude mcp add tusk --env PGHOST=localhost --env PGPORT=5432 \
+  --env PGDATABASE=app_dev --env PGUSER=postgres --env PGPASSWORD=secret -- tusk mcp
+```
+
+### Tools exposed today
 
 | Tool | Purpose |
 | --- | --- |
 | `list_databases` | Every database on the connected server |
-| `describe_schema` | Tables, columns, types, keys, indexes for a database |
-| `run_query` | Execute a **read-only** SQL query, returns rows as structured JSON |
-| `explain_query` | `EXPLAIN`/`EXPLAIN ANALYZE` a query without running it destructively |
-| `propose_write` | Draft an `INSERT`/`UPDATE`/migration that a human approves in the GUI |
+| `describe_schema` | Tables/views/relations in a database (defaults to the connected one) |
+| `describe_table` | A table's columns, types, and PK/FK/NOT NULL flags |
+| `run_query` | Execute a **read-only** SQL query; returns rows as structured JSON |
 
-Design principles:
+**`run_query` is safe by construction:** every statement runs inside a `READ ONLY`
+transaction with a statement timeout, so a write is rejected by Postgres itself
+(*"cannot execute INSERT in a read-only transaction"*) — no fragile SQL parsing — and the
+transaction is always rolled back. Results are capped at 1000 rows.
 
-- **Read by default, write by consent.** Mutations are surfaced in the GUI for explicit
-  human approval before they ever touch the database.
-- **Least privilege.** Point the MCP server at a read-only role and it physically cannot do
+### Where it's heading
+
+- **Write by consent** — `propose_write` drafts an `INSERT`/`UPDATE`/migration that a human
+  approves in the GUI before it touches the database.
+- **Least privilege** — point the connection at a read-only role and it physically cannot do
   more than read.
-- **Shared context.** The agent sees exactly what you see in the explorer, so its SQL is
-  grounded in your real schema — not a hallucinated one.
+- **Shared context** — because the server rides on the app's live connection, the agent's SQL
+  is grounded in your real schema, not a hallucinated one.
 
 ---
 
@@ -186,7 +211,9 @@ Sources/
 ├── CPostgres/                # system-library shim exposing libpq to Swift
 ├── TuskCore/                 # shared, GUI-free core (linked by both app and CLI)
 │   ├── Models.swift          #   Connection, Relation, ColumnInfo, DBObjectKind
-│   └── PostgresService.swift #   Database actor — one libpq connection per database
+│   ├── PostgresService.swift #   Database actor — one libpq connection per database
+│   ├── MCPSession.swift      #   MCP JSON-RPC session + tool definitions
+│   └── MCPTransport.swift    #   unix-socket server, stdio session, stdio↔socket bridge
 ├── Tusk/                     # GUI app (SwiftUI/AppKit) → Tusk.app
 │   ├── TuskApp.swift         #   @main app entry, window + routing
 │   ├── AppModel.swift        #   observable app state (connections, schema, selection)
@@ -206,8 +233,9 @@ Sources/
   connection is bound to a single database, Tusk keeps **one connection per database**,
   cloned from the base config, and opens them on demand. This is exactly the boundary the
   MCP server will sit behind.
-- **`AppModel`** is the single source of truth the SwiftUI views observe. The MCP tools and
-  the GUI will read the same model, which is what makes the two halves stay in sync.
+- **`AppModel`** is the single source of truth the SwiftUI views observe, and it starts an
+  `MCPSocketServer` on the same `Database` when a connection opens — so the MCP tools and the
+  GUI read the exact same live connections.
 
 > The GUI build product is `Tusk` and the CLI build product is `tuskcli` (installed as
 > `tusk`) — named apart on purpose, since macOS's case-insensitive filesystem can't hold
@@ -217,9 +245,10 @@ Sources/
 
 ## Roadmap
 
-- [ ] **`tusk mcp`** — stdio MCP server exposing schema introspection + read queries
-- [ ] Read query execution with a result grid in the GUI
-- [ ] Human-in-the-loop write/migration approval flow
+- [x] **MCP server** over a unix socket: `list_databases`, `describe_schema`,
+      `describe_table`, read-only `run_query`; `tusk mcp` bridges Claude Code's stdio to it
+- [ ] Result grid in the GUI for `run_query`
+- [ ] Human-in-the-loop write/migration approval flow (`propose_write`)
 - [ ] Connection pooling / eviction for many-database servers
 - [ ] Query history and saved queries, shared between agent and human
 - [ ] Additional engines: MySQL, SQLite

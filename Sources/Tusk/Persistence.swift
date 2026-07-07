@@ -5,7 +5,7 @@ import TuskCore
 // MARK: - Keychain (password storage)
 
 enum Keychain {
-    private static let service = "ai.runllama.tusk"
+    private static let service = "com.veshnu.Tusk"
 
     static func save(_ password: String, for id: String) {
         let account = id

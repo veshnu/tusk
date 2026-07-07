@@ -24,6 +24,6 @@ cask "tusk" do
 
   zap trash: [
     "~/Library/Application Support/Tusk",
-    "~/Library/Preferences/ai.runllama.tusk.plist",
+    "~/Library/Preferences/com.veshnu.Tusk.plist",
   ]
 end

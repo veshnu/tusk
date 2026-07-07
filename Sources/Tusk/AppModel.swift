@@ -34,6 +34,9 @@ final class AppModel: ObservableObject {
 
     let db = Database()
 
+    /// MCP server hosting the live connection over the app's unix socket.
+    private var mcpServer: MCPSocketServer?
+
     var palette: Palette { Palette(isDark: isDark) }
 
     func toggleTheme() { isDark.toggle() }
@@ -63,6 +66,7 @@ final class AppModel: ObservableObject {
                 selectedDatabase = conn.database
                 route = .workspace
                 selectFirstRelation(in: conn.database)
+                startMCPServer(for: conn)
             } catch {
                 connectError = error.localizedDescription
             }
@@ -105,7 +109,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: MCP server lifecycle
+
+    private func startMCPServer(for conn: Connection) {
+        mcpServer?.stop()
+        let server = MCPSocketServer(db: db, connection: conn)
+        do {
+            try server.start()
+            mcpServer = server
+        } catch {
+            // Non-fatal: the GUI keeps working even if the socket can't be hosted.
+            NSLog("Tusk: failed to start MCP server: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopMCPServer() {
+        mcpServer?.stop()
+        mcpServer = nil
+    }
+
     func disconnect() {
+        stopMCPServer()
         Task { await db.close() }
         activeConn = nil
         databases = []

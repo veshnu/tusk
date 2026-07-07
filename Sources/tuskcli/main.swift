@@ -15,6 +15,21 @@ func env(_ key: String, _ fallback: String) -> String {
     return (v?.isEmpty == false) ? v! : fallback
 }
 
+/// A connection assembled from standard PG* environment variables.
+func connectionFromEnv() -> Connection {
+    Connection(
+        name: "cli",
+        host: env("PGHOST", "localhost"),
+        port: env("PGPORT", "5432"),
+        database: env("PGDATABASE", "postgres"),
+        user: env("PGUSER", "postgres"),
+        sslMode: env("PGSSLMODE", "prefer"),
+        savePassword: false,
+        env: "local",
+        password: env("PGPASSWORD", "")
+    )
+}
+
 func warn(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
@@ -27,11 +42,13 @@ func printUsage() {
       tusk <command> [options]
 
     COMMANDS:
-      mcp         Start the MCP server over stdio (for Claude Code & other MCP clients)
-      selfcheck   Verify the libpq path against a live Postgres (reads PG* env vars)
-      doctor      Check the local environment (libpq, app install)
-      version     Print the version
-      help        Show this help
+      mcp           Bridge Claude Code's stdio to the running app's MCP socket
+                    (falls back to serving over stdio from PG* env if the app isn't running)
+      mcp --serve   Run the MCP server headlessly on the unix socket (PG* env connection)
+      selfcheck     Verify the libpq path against a live Postgres (reads PG* env vars)
+      doctor        Check the local environment (libpq, app install)
+      version       Print the version
+      help          Show this help
     """)
 }
 
@@ -54,17 +71,7 @@ func runDoctor() {
 /// Headless verification of the real libpq code path against a live Postgres.
 /// Reads standard PG* env vars; falls back to local defaults.
 func runSelfCheck() async {
-    let cfg = Connection(
-        name: "selfcheck",
-        host: env("PGHOST", "localhost"),
-        port: env("PGPORT", "5432"),
-        database: env("PGDATABASE", "postgres"),
-        user: env("PGUSER", "postgres"),
-        sslMode: env("PGSSLMODE", "prefer"),
-        savePassword: false,
-        env: "local",
-        password: env("PGPASSWORD", "")
-    )
+    let cfg = connectionFromEnv()
     let db = Database()
     do {
         let t = try await db.test(cfg)
@@ -86,6 +93,53 @@ func runSelfCheck() async {
     }
 }
 
+/// `tusk mcp --serve`: run the socket server headlessly (connection from PG* env).
+/// This is what a standalone/daemon deployment uses; the GUI hosts the same server
+/// in-process when it's running.
+func runMCPServe() async {
+    let cfg = connectionFromEnv()
+    let db = Database()
+    do {
+        try await db.open(cfg)
+    } catch {
+        warn("tusk mcp --serve: could not connect using PG* env vars: \(error.localizedDescription)")
+        exit(1)
+    }
+    let server = MCPSocketServer(db: db, connection: cfg)
+    do {
+        try server.start()
+    } catch {
+        warn("tusk mcp --serve: \(error.localizedDescription)")
+        exit(1)
+    }
+    warn("tusk mcp: serving on \(server.socketPath) (db: \(cfg.database))")
+    while true { try? await Task.sleep(nanoseconds: 3_600_000_000_000) } // run until killed
+}
+
+/// `tusk mcp`: what Claude Code spawns. Bridge stdio to the running app's socket;
+/// if the app isn't hosting one, fall back to serving MCP directly over stdio
+/// using a PG* env connection.
+func runMCP() async {
+    let path = TuskPaths.mcpSocketPath
+    if FileManager.default.fileExists(atPath: path) {
+        if runMCPSocketBridge(socketPath: path) { exit(0) }
+        warn("tusk mcp: found a socket at \(path) but couldn't connect; falling back to stdio.")
+    }
+    let cfg = connectionFromEnv()
+    let db = Database()
+    do {
+        try await db.open(cfg)
+    } catch {
+        warn("""
+        tusk mcp: no running Tusk MCP socket, and could not open a Postgres connection \
+        from PG* env vars: \(error.localizedDescription)
+        Open Tusk and connect to a database, or set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD.
+        """)
+        exit(1)
+    }
+    await runStdioMCPSession(db: db, connection: cfg)
+}
+
 switch command {
 case "version", "--version", "-v":
     print("tusk \(toolVersion)")
@@ -96,8 +150,11 @@ case "doctor":
 case "selfcheck":
     await runSelfCheck()
 case "mcp":
-    warn("tusk mcp: the MCP server is not implemented yet.")
-    exit(1)
+    if arguments.dropFirst().contains("--serve") {
+        await runMCPServe()
+    } else {
+        await runMCP()
+    }
 default:
     warn("Unknown command: \(command ?? "")\n")
     printUsage()
