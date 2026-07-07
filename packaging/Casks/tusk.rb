@@ -22,6 +22,20 @@ cask "tusk" do
   app "Tusk.app"
   binary "tusk" # the CLI ships alongside Tusk.app in the release zip
 
+  # Register the MCP server with Claude Code at user scope so it's ready in every
+  # project. Best-effort: does nothing if the `claude` CLI isn't installed.
+  postflight do
+    system_command "/bin/sh", args: ["-c",
+      "command -v claude >/dev/null 2>&1 && " \
+      "{ claude mcp remove tusk -s user >/dev/null 2>&1; " \
+      "claude mcp add tusk -s user -- '#{HOMEBREW_PREFIX}/bin/tusk' mcp; } || true"]
+  end
+
+  uninstall_postflight do
+    system_command "/bin/sh", args: ["-c",
+      "command -v claude >/dev/null 2>&1 && claude mcp remove tusk -s user >/dev/null 2>&1 || true"]
+  end
+
   zap trash: [
     "~/Library/Application Support/Tusk",
     "~/Library/Preferences/com.veshnu.Tusk.plist",

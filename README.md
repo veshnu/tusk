@@ -94,18 +94,26 @@ Claude Code ──stdio──▶ tusk mcp ──unix socket──▶ Tusk.app �
 
 ### Add it to Claude Code
 
+**The installer does this for you.** Both `make install` and `brew install --cask tusk`
+register the server with Claude Code at **user scope** (available in every project) —
+equivalent to running:
+
 ```bash
-claude mcp add tusk -- tusk mcp
+claude mcp add tusk -s user -- tusk mcp
 ```
 
+(Best-effort: if the `claude` CLI isn't on `PATH` at install time, registration is skipped
+and the command above is printed so you can run it yourself. `make uninstall` and the cask's
+uninstall remove the entry again.)
+
 Then, in the app, connect to a database — and ask Claude Code things like
-*"what columns does public.orders have?"* or *"count rows per status in orders"*.
+*"what tables are in this database?"* or *"describe the orders table"*.
 
 If the app isn't running, `tusk mcp` falls back to serving directly over stdio using
 standard `PG*` environment variables, so it still works headless (e.g. in CI):
 
 ```bash
-claude mcp add tusk --env PGHOST=localhost --env PGPORT=5432 \
+claude mcp add tusk -s user --env PGHOST=localhost --env PGPORT=5432 \
   --env PGDATABASE=app_dev --env PGUSER=postgres --env PGPASSWORD=secret -- tusk mcp
 ```
 
@@ -175,6 +183,9 @@ cd tusk
 brew install libpq
 make install                 # → /Applications/Tusk.app  +  tusk on PATH
 ```
+
+`make install` also registers the MCP server with Claude Code at user scope (see
+[Add it to Claude Code](#add-it-to-claude-code)).
 
 Other Makefile targets: `make` (build + assemble `dist/Tusk.app` and `dist/tusk` without
 installing), `make dist` (zip a release artifact), `make uninstall`, `make clean`.

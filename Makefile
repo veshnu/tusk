@@ -19,7 +19,7 @@ BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
 BINDIR    ?= $(if $(BREW_PREFIX),$(BREW_PREFIX)/bin,/usr/local/bin)
 APPDIR    ?= /Applications
 
-.PHONY: all build bundle install uninstall dist icon clean
+.PHONY: all build bundle install uninstall register-mcp unregister-mcp dist icon clean
 
 all: bundle
 
@@ -51,11 +51,27 @@ install: bundle
 	@mkdir -p "$(BINDIR)"
 	install -m 0755 "$(DIST_DIR)/tusk" "$(BINDIR)/tusk"
 	@echo "Installed $(APPDIR)/$(APP_NAME).app and $(BINDIR)/tusk"
+	@$(MAKE) --no-print-directory register-mcp
 
-uninstall:
+# Register the MCP server with Claude Code at user scope (available in all
+# projects). Best-effort: skips gracefully if the `claude` CLI isn't installed.
+register-mcp:
+	@if command -v claude >/dev/null 2>&1; then \
+		claude mcp remove tusk -s user >/dev/null 2>&1 || true; \
+		claude mcp add tusk -s user -- "$(BINDIR)/tusk" mcp >/dev/null && \
+		echo "Registered MCP server 'tusk' with Claude Code (user scope)."; \
+	else \
+		echo "Note: 'claude' CLI not found — skipped MCP registration."; \
+		echo "      To add it later:  claude mcp add tusk -s user -- $(BINDIR)/tusk mcp"; \
+	fi
+
+unregister-mcp:
+	@command -v claude >/dev/null 2>&1 && claude mcp remove tusk -s user >/dev/null 2>&1 || true
+
+uninstall: unregister-mcp
 	rm -rf "$(APPDIR)/$(APP_NAME).app"
 	rm -f "$(BINDIR)/tusk"
-	@echo "Removed $(APPDIR)/$(APP_NAME).app and $(BINDIR)/tusk"
+	@echo "Removed $(APPDIR)/$(APP_NAME).app, $(BINDIR)/tusk, and the Claude MCP entry"
 
 # Release artifact: a zip containing both Tusk.app and the tusk binary, for the cask.
 dist: bundle
