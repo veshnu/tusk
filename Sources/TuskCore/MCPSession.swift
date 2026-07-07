@@ -21,11 +21,13 @@ public enum TuskPaths {
 enum MCPError: LocalizedError {
     case invalidArguments(String)
     case unknownTool(String)
+    case blocked(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidArguments(let m): return m
         case .unknownTool(let name): return "Unknown tool: \(name)"
+        case .blocked(let m): return m
         }
     }
 }
@@ -141,6 +143,7 @@ public actor MCPSession {
             guard let sql = (args["sql"] as? String), !sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw MCPError.invalidArguments("`sql` is required")
             }
+            try Self.guardCredentials(sql)
             let qr = try await db.query(database: database, sql: sql)
             var payload: [String: Any] = [
                 "database": database,
@@ -153,6 +156,19 @@ public actor MCPSession {
 
         default:
             throw MCPError.unknownTool(name)
+        }
+    }
+
+    /// Postgres catalogs/columns that hold credential material (password *hashes* — plaintext
+    /// is never stored). Postgres already restricts these to superusers, but we block them at
+    /// the MCP boundary too, so the agent surface can't pull credentials even on a superuser
+    /// connection. Defense-in-depth; the real boundary is connecting Tusk as a read-only role.
+    static let blockedIdentifiers = ["pg_authid", "pg_shadow", "rolpassword"]
+
+    static func guardCredentials(_ sql: String) throws {
+        let lowered = sql.lowercased()
+        for id in blockedIdentifiers where lowered.contains(id) {
+            throw MCPError.blocked("Blocked: `\(id)` holds credential data and is not readable through Tusk.")
         }
     }
 

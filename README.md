@@ -123,6 +123,12 @@ transaction with a statement timeout, so a write is rejected by Postgres itself
 (*"cannot execute INSERT in a read-only transaction"*) — no fragile SQL parsing — and the
 transaction is always rolled back. Results are capped at 1000 rows.
 
+**No credentials leak through the tools.** Plaintext passwords are never stored in Postgres,
+and no tool ever emits Tusk's own saved connection password. As defense-in-depth, `run_query`
+also blocks the credential catalogs that hold password *hashes* (`pg_authid`, `pg_shadow`,
+`rolpassword`) even on a superuser connection. The real security boundary is still to connect
+Tusk as a **least-privilege, read-only role**.
+
 ### Where it's heading
 
 - **Write by consent** — `propose_write` drafts an `INSERT`/`UPDATE`/migration that a human
