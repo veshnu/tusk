@@ -1,6 +1,23 @@
 import SwiftUI
 import TuskCore
 
+/// One open table in the center pane. `id` is "database|schema.name".
+struct DataTab: Identifiable, Equatable {
+    let id: String
+    let database: String
+    let relation: Relation
+    var columns: [String] = []
+    var columnInfos: [ColumnInfo] = []      // for header type badges / key glyphs
+    var rows: [[String?]] = []
+    var loading: Bool = true
+    var error: String? = nil
+
+    /// Column metadata keyed by name (type badge + PK/FK glyphs in the grid header).
+    func info(for column: String) -> ColumnInfo? { columnInfos.first { $0.name == column } }
+
+    static func makeID(database: String, relationID: String) -> String { "\(database)|\(relationID)" }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum Route { case connect, workspace }
@@ -40,13 +57,9 @@ final class AppModel: ObservableObject {
     @Published var columns: [ColumnInfo] = []
     @Published var loadingColumns = false
 
-    // Opened table data shown in the center pane (driven by double-click).
-    @Published var openedDatabase: String?
-    @Published var openedRelationID: String?
-    @Published var dataColumns: [String] = []
-    @Published var dataRows: [[String?]] = []
-    @Published var loadingData = false
-    @Published var dataError: String?
+    // Open table tabs shown in the center pane (each double-click opens/focuses one).
+    @Published var tabs: [DataTab] = []
+    @Published var activeTabID: String?
 
     let db = Database()
 
@@ -162,11 +175,8 @@ final class AppModel: ObservableObject {
         selectedDatabase = nil
         selectedRelationID = nil
         inspector = .server
-        openedDatabase = nil
-        openedRelationID = nil
-        dataColumns = []
-        dataRows = []
-        dataError = nil
+        tabs = []
+        activeTabID = nil
         route = .connect
     }
 
@@ -205,31 +215,71 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: Table data (double-click)
+    // MARK: Table tabs (double-click)
 
-    /// Double-click a relation: select it *and* load a page of its rows into the center pane.
+    /// Double-click a relation: select it, and open (or focus) a data tab for it.
     func openTable(database: String, relation: Relation) {
         select(database: database, relation: relation)
-        openedDatabase = database
-        openedRelationID = relation.id
-        loadingData = true
-        dataError = nil
-        dataColumns = []
-        dataRows = []
-        let token = "\(database)|\(relation.id)"
-        Task {
-            do {
-                let set = try await db.rows(database: database, schema: relation.schema, table: relation.name, limit: 200)
-                if openToken == token { dataColumns = set.columns; dataRows = set.rows }
-            } catch {
-                if openToken == token { dataError = error.localizedDescription }
-            }
-            loadingData = false
+        let id = DataTab.makeID(database: database, relationID: relation.id)
+        activeTabID = id
+        if tabs.contains(where: { $0.id == id }) { return }   // already open — just focus it
+        tabs.append(DataTab(id: id, database: database, relation: relation))
+        loadRows(for: id, database: database, relation: relation)
+    }
+
+    /// Switch to an already-open tab and sync the inspector to its relation.
+    func focusTab(_ id: String) {
+        activeTabID = id
+        if let tab = tabs.first(where: { $0.id == id }) {
+            select(database: tab.database, relation: tab.relation)
         }
     }
 
+    func closeTab(_ id: String) {
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        tabs.remove(at: idx)
+        if activeTabID == id {
+            let next = tabs[safe: idx] ?? tabs[safe: idx - 1]
+            if let next { focusTab(next.id) } else { activeTabID = nil }
+        }
+    }
+
+    /// Reload the rows for a tab (e.g. the toolbar refresh button).
+    func reloadTab(_ id: String) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        loadRows(for: id, database: tab.database, relation: tab.relation)
+    }
+
+    private func loadRows(for id: String, database: String, relation: Relation) {
+        updateTab(id) { $0.loading = true; $0.error = nil; $0.columns = []; $0.rows = [] }
+        Task {
+            do {
+                let cols = try await db.columns(database: database, schema: relation.schema, table: relation.name)
+                let set = try await db.rows(database: database, schema: relation.schema, table: relation.name, limit: 200)
+                updateTab(id) {
+                    $0.columnInfos = cols
+                    $0.columns = set.columns
+                    $0.rows = set.rows
+                    $0.loading = false
+                }
+            } catch {
+                updateTab(id) { $0.error = error.localizedDescription; $0.loading = false }
+            }
+        }
+    }
+
+    /// Mutate a tab in place if it still exists (it may have been closed mid-load).
+    private func updateTab(_ id: String, _ mutate: (inout DataTab) -> Void) {
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        mutate(&tabs[idx])
+    }
+
     private var selectionToken: String { "\(selectedDatabase ?? "")|\(selectedRelationID ?? "")" }
-    private var openToken: String { "\(openedDatabase ?? "")|\(openedRelationID ?? "")" }
+
+    var activeTab: DataTab? {
+        guard let id = activeTabID else { return nil }
+        return tabs.first { $0.id == id }
+    }
 
     var selectedSnapshot: DBSnapshot? {
         guard let d = selectedDatabase else { return nil }
@@ -239,10 +289,10 @@ final class AppModel: ObservableObject {
     var selectedRelation: Relation? {
         selectedSnapshot?.relations.first { $0.id == selectedRelationID }
     }
+}
 
-    /// The relation whose data is open in the center pane, if any.
-    var openedRelation: Relation? {
-        guard let d = openedDatabase, let id = openedRelationID else { return nil }
-        return snapshots[d]?.relations.first { $0.id == id }
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
