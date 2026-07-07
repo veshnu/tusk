@@ -37,6 +37,10 @@ final class AppModel: ObservableObject {
     @Published var loadingDatabases: Set<String> = []
     @Published var databaseErrors: [String: String] = [:]
 
+    // Live connection health, polled while connected ("connected" / "error" / "connecting").
+    @Published var connectionStatus: String = "connecting"
+    private var healthTask: Task<Void, Never>?
+
     // Transient UI state
     @Published var connecting = false
     @Published var connectError: String?
@@ -79,8 +83,9 @@ final class AppModel: ObservableObject {
         return "\(c.user)@\(c.host)"
     }
 
-    /// Open a connection, enumerate databases, load the connected database's schema,
-    /// and route into the workspace on success.
+    /// Open a connection, load the connected database's schema, and route into the
+    /// workspace on success. Only the connected database is browsed — Tusk holds a
+    /// single connection rather than one per database on the server.
     func connect(_ conn: Connection) {
         guard !connecting else { return }
         connecting = true
@@ -88,17 +93,18 @@ final class AppModel: ObservableObject {
         Task {
             do {
                 try await db.open(conn)
-                let dbs = try await db.databases()
                 let snap = try await db.snapshot(database: conn.database)
                 activeConn = conn
-                databases = dbs.contains(conn.database) ? dbs : ([conn.database] + dbs)
+                databases = [conn.database]
                 snapshots = [conn.database: snap]
                 expandedDatabases = [conn.database]
                 databaseErrors = [:]
                 selectedDatabase = conn.database
                 route = .workspace
+                connectionStatus = "connected"
                 selectServer()
                 startMCPServer(for: conn)
+                startHealthMonitor()
             } catch {
                 connectError = error.localizedDescription
             }
@@ -134,7 +140,6 @@ final class AppModel: ObservableObject {
         schemaError = nil
         Task {
             do {
-                databases = try await db.databases()
                 for d in loaded { snapshots[d] = try await db.snapshot(database: d) }
             } catch { schemaError = error.localizedDescription }
             loadingSchema = false
@@ -162,8 +167,30 @@ final class AppModel: ObservableObject {
         mcpServer = nil
     }
 
+    // MARK: Connection health
+
+    /// Poll the live connection every few seconds and reflect it in `connectionStatus`.
+    private func startHealthMonitor() {
+        healthTask?.cancel()
+        healthTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let ok = await self.db.ping()
+                if Task.isCancelled { return }
+                self.connectionStatus = ok ? "connected" : "error"
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
+        }
+    }
+
+    private func stopHealthMonitor() {
+        healthTask?.cancel()
+        healthTask = nil
+    }
+
     func disconnect() {
         stopMCPServer()
+        stopHealthMonitor()
         Task { await db.close() }
         activeConn = nil
         databases = []
@@ -177,6 +204,7 @@ final class AppModel: ObservableObject {
         inspector = .server
         tabs = []
         activeTabID = nil
+        connectionStatus = "connecting"
         route = .connect
     }
 
@@ -238,6 +266,7 @@ final class AppModel: ObservableObject {
     func closeTab(_ id: String) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
         tabs.remove(at: idx)
+        Task { await db.closeTab(id) }   // release this tab's dedicated connection
         if activeTabID == id {
             let next = tabs[safe: idx] ?? tabs[safe: idx - 1]
             if let next { focusTab(next.id) } else { activeTabID = nil }
@@ -254,8 +283,8 @@ final class AppModel: ObservableObject {
         updateTab(id) { $0.loading = true; $0.error = nil; $0.columns = []; $0.rows = [] }
         Task {
             do {
-                let cols = try await db.columns(database: database, schema: relation.schema, table: relation.name)
-                let set = try await db.rows(database: database, schema: relation.schema, table: relation.name, limit: 200)
+                let cols = try await db.tabColumns(tab: id, database: database, schema: relation.schema, table: relation.name)
+                let set = try await db.tabRows(tab: id, database: database, schema: relation.schema, table: relation.name, limit: 200)
                 updateTab(id) {
                     $0.columnInfos = cols
                     $0.columns = set.columns

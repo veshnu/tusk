@@ -95,7 +95,7 @@ private struct TitleBar: View {
                 } label: { Label("Disconnect", systemImage: "bolt.horizontal.circle") }
             } label: {
                 HStack(spacing: 8) {
-                    StatusDot(status: "connected", size: 7)
+                    StatusDot(status: model.connectionStatus, size: 7)
                     Text(model.activeConn?.name ?? "—")
                         .font(.ui(12))
                         .foregroundColor(pal.textSecondary)
@@ -847,7 +847,7 @@ private struct InfoRail: View {
             Image(systemName: icon).font(.system(size: 14)).foregroundColor(pal.textMuted)
             Text(title).font(.ui(13, weight: .semibold)).foregroundColor(pal.textPrimary)
             Spacer()
-            StatusDot(status: "connected", size: 7)
+            StatusDot(status: model.connectionStatus, size: 7)
         }
         .padding(.horizontal, 14)
         .frame(height: Metrics.toolbarHeight)
