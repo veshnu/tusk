@@ -19,12 +19,20 @@ BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
 BINDIR    ?= $(if $(BREW_PREFIX),$(BREW_PREFIX)/bin,/usr/local/bin)
 APPDIR    ?= /Applications
 
-.PHONY: all build bundle install uninstall dist clean
+.PHONY: all build bundle install uninstall dist icon clean
 
 all: bundle
 
 build:
 	swift build -c $(CONFIG)
+
+# Regenerate packaging/AppIcon.icns from the CoreGraphics renderer.
+icon:
+	@rm -rf "$(DIST_DIR)/AppIcon.iconset" && mkdir -p "$(DIST_DIR)/AppIcon.iconset"
+	@swiftc -O packaging/makeicon.swift -o "$(DIST_DIR)/makeicon"
+	@"$(DIST_DIR)/makeicon" "$(DIST_DIR)/AppIcon.iconset"
+	@iconutil -c icns "$(DIST_DIR)/AppIcon.iconset" -o packaging/AppIcon.icns
+	@echo "Regenerated packaging/AppIcon.icns"
 
 # Assemble Tusk.app around the built GUI binary, and stage the CLI as `tusk`.
 bundle: build
@@ -32,6 +40,7 @@ bundle: build
 	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	@cp "$(BUILD_DIR)/$(APP_NAME)" "$(APP)/Contents/MacOS/$(APP_NAME)"
 	@sed 's/__VERSION__/$(VERSION)/g' packaging/Info.plist.in > "$(APP)/Contents/Info.plist"
+	@cp packaging/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
 	@cp "$(BUILD_DIR)/tuskcli" "$(DIST_DIR)/tusk"
 	@chmod +x "$(DIST_DIR)/tusk"
 	@echo "Built $(APP) and $(DIST_DIR)/tusk"
