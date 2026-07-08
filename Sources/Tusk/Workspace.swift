@@ -515,6 +515,8 @@ private struct CenterPane: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    @State private var expanded: ExpandedValue?
+
     var body: some View {
         VStack(spacing: 0) {
             if model.tabs.isEmpty {
@@ -532,6 +534,7 @@ private struct CenterPane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(pal.surfaceRaised)
+        .overlay { if let e = expanded { CellValueViewer(value: e) { expanded = nil } } }
     }
 
     @ViewBuilder private func dataTabView(_ tab: DataTab) -> some View {
@@ -589,7 +592,8 @@ private struct CenterPane: View {
             center { Image(systemName: "tablecells").font(.system(size: 22)).foregroundColor(pal.textFaint)
                      Text("No rows").font(.ui(13)).foregroundColor(pal.textMuted) }
         } else {
-            ResultGrid(gridID: tab.id, columns: tab.columns, columnInfos: tab.columnInfos, rows: tab.rows)
+            ResultGrid(gridID: tab.id, columns: tab.columns, columnInfos: tab.columnInfos, rows: tab.rows,
+                       onExpand: { col, val in expanded = ExpandedValue(column: col, value: val) })
         }
     }
 
