@@ -40,6 +40,36 @@ public struct TableInfo: Sendable {
     }
 }
 
+/// A query console open in the app (summary form, for `list_query_consoles`).
+public struct ConsoleInfo: Sendable {
+    public let id: String
+    public let database: String     // database name the console runs against
+    public let title: String
+    public let selected: Bool       // is this the focused tab?
+
+    public init(id: String, database: String, title: String, selected: Bool) {
+        self.id = id; self.database = database; self.title = title; self.selected = selected
+    }
+}
+
+/// A query console's full state: its SQL buffer and latest results.
+public struct ConsoleDetail: Sendable {
+    public let id: String
+    public let database: String
+    public let title: String
+    public let sql: String
+    public let columns: [String]
+    public let rows: [[String?]]
+    public let error: String?
+    public let running: Bool
+
+    public init(id: String, database: String, title: String, sql: String,
+                columns: [String], rows: [[String?]], error: String?, running: Bool) {
+        self.id = id; self.database = database; self.title = title; self.sql = sql
+        self.columns = columns; self.rows = rows; self.error = error; self.running = running
+    }
+}
+
 // MARK: - ID helpers
 
 public enum TuskID {
@@ -72,6 +102,29 @@ public protocol TuskStateProviding: Sendable {
     func listDatabases(connectionId: String) async throws -> [DatabaseInfo]
     func listTables(databaseId: String) async throws -> [TableInfo]
     func describeTable(databaseId: String, tableId: String) async throws -> [ColumnInfo]
+
+    // Query consoles — driving Tusk's GUI from MCP. Only the app-backed provider
+    // implements these; the headless CLI has no window to open consoles in.
+    func createQueryConsole(databaseId: String, sql: String?) async throws -> String
+    func listQueryConsoles() async -> [ConsoleInfo]
+    func selectedQueryConsole() async -> String?
+    func selectQueryConsole(consoleId: String) async throws
+    func getQueryConsole(consoleId: String) async throws -> ConsoleDetail
+    func setQueryConsoleSQL(consoleId: String, sql: String) async throws -> ConsoleDetail
+    func runQueryConsole(consoleId: String) async throws -> ConsoleDetail
+}
+
+/// Default console methods: unsupported unless a GUI-backed provider overrides them.
+public extension TuskStateProviding {
+    private var noConsoles: MCPError { .notConnected("Query consoles require the Tusk app to be running.") }
+
+    func createQueryConsole(databaseId: String, sql: String?) async throws -> String { throw noConsoles }
+    func listQueryConsoles() async -> [ConsoleInfo] { [] }
+    func selectedQueryConsole() async -> String? { nil }
+    func selectQueryConsole(consoleId: String) async throws { throw noConsoles }
+    func getQueryConsole(consoleId: String) async throws -> ConsoleDetail { throw noConsoles }
+    func setQueryConsoleSQL(consoleId: String, sql: String) async throws -> ConsoleDetail { throw noConsoles }
+    func runQueryConsole(consoleId: String) async throws -> ConsoleDetail { throw noConsoles }
 }
 
 // MARK: - Headless provider (single connection, for `tusk mcp` without the app)

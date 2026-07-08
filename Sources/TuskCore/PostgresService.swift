@@ -268,6 +268,21 @@ public actor PGConnection {
         let res = try PGRaw.exec(c, sql)
         return RowSet(columns: res.columns, rows: res.rows)
     }
+
+    /// Run arbitrary SQL on this connection and return the result set. Non-row
+    /// statements (INSERT/UPDATE/DDL) come back as an empty `RowSet`. When
+    /// `readOnly` is set, the connection is put in a read-only transaction so
+    /// writes are rejected by the server.
+    public func query(_ sql: String, readOnly: Bool = false) throws -> RowSet {
+        let c = try handle()
+        if readOnly {
+            _ = try? PGRaw.exec(c, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        } else {
+            _ = try? PGRaw.exec(c, "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+        }
+        let res = try PGRaw.exec(c, sql)
+        return RowSet(columns: res.columns, rows: res.rows)
+    }
 }
 
 // MARK: - Connection lanes
@@ -279,6 +294,7 @@ public actor Database {
     private var baseConfig: Connection?
     private var browse: [String: PGConnection] = [:]   // keyed by database
     private var tabLanes: [String: PGConnection] = [:]  // keyed by tab id
+    private var consoleLanes: [String: PGConnection] = [:]  // keyed by query-console id
 
     public init() {}
 
@@ -298,8 +314,10 @@ public actor Database {
     private func closeAll() async {
         for (_, c) in browse { await c.close() }
         for (_, c) in tabLanes { await c.close() }
+        for (_, c) in consoleLanes { await c.close() }
         browse = [:]
         tabLanes = [:]
+        consoleLanes = [:]
         baseConfig = nil
     }
 
@@ -370,5 +388,28 @@ public actor Database {
     /// Close and drop a tab's dedicated connection.
     public func closeTab(_ tab: String) async {
         if let c = tabLanes.removeValue(forKey: tab) { await c.close() }
+    }
+
+    // MARK: - Per-console lanes (query console)
+
+    /// One dedicated connection per query console, bound to the console's database —
+    /// so each console runs on its own connection independent of the browse/data lanes.
+    private func consoleLane(_ console: String, database: String) throws -> PGConnection {
+        if let c = consoleLanes[console] { return c }
+        guard let cfg0 = baseConfig else { throw PGError.notConnected }
+        var cfg = cfg0; cfg.database = database
+        let c = PGConnection(cfg)
+        consoleLanes[console] = c
+        return c
+    }
+
+    /// Execute a console's SQL on its dedicated lane.
+    public func runConsole(_ console: String, database: String, sql: String, readOnly: Bool = false) async throws -> RowSet {
+        try await consoleLane(console, database: database).query(sql, readOnly: readOnly)
+    }
+
+    /// Close and drop a console's dedicated connection.
+    public func closeConsole(_ console: String) async {
+        if let c = consoleLanes.removeValue(forKey: console) { await c.close() }
     }
 }

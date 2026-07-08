@@ -98,9 +98,7 @@ private struct TitleBar: View {
                 model.toggleTerminal()
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: "asterisk")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(model.showTerminal ? pal.accent : pal.textMuted)
+                    ClaudeMark(size: 13)
                     Text("Claude Code")
                         .font(.ui(12))
                         .foregroundColor(model.showTerminal ? pal.accent : pal.textSecondary)
@@ -278,6 +276,11 @@ private struct SchemaSidebar: View {
                 onToggle: { model.toggleDatabase(dbName) },
                 onSelect: { model.selectDatabase(dbName) },
                 onOpen: { model.toggleDatabase(dbName) })
+            .contextMenu {
+                Button {
+                    model.openConsole(database: dbName)
+                } label: { Label("New Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
+            }
 
         if dbExpanded {
             if model.loadingDatabases.contains(dbName) {
@@ -312,6 +315,15 @@ private struct SchemaSidebar: View {
                                     onToggle: {},
                                     onSelect: { model.select(database: dbName, relation: rel) },
                                     onOpen: { model.openTable(database: dbName, relation: rel) })
+                                .contextMenu {
+                                    Button {
+                                        model.openTable(database: dbName, relation: rel)
+                                    } label: { Label("Open Table", systemImage: "tablecells") }
+                                    Button {
+                                        model.openConsole(database: dbName,
+                                                          seedSQL: "SELECT * FROM \(rel.schema).\(rel.name) LIMIT 100")
+                                    } label: { Label("Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
+                                }
                         }
                     }
                 }
@@ -431,14 +443,6 @@ private struct CenterPane: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
-    private let defaultCellWidth: CGFloat = 180
-    private let headerHeight: CGFloat = 44
-    /// User-resized column widths, keyed "tabID|columnName".
-    @State private var colWidths: [String: CGFloat] = [:]
-
-    private func colKey(_ tab: DataTab, _ name: String) -> String { "\(tab.id)|\(name)" }
-    private func colWidth(_ tab: DataTab, _ name: String) -> CGFloat { colWidths[colKey(tab, name)] ?? defaultCellWidth }
-
     var body: some View {
         VStack(spacing: 0) {
             if model.tabs.isEmpty {
@@ -447,14 +451,21 @@ private struct CenterPane: View {
                 tabBar
                 Divider().overlay(pal.borderDefault)
                 if let tab = model.activeTab {
-                    contextBar(tab)
-                    Divider().overlay(pal.borderSubtle)
-                    content(tab)
+                    switch tab {
+                    case .data(let t):    dataTabView(t)
+                    case .console(let c): ConsolePane(console: c).id(c.id)
+                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(pal.surfaceRaised)
+    }
+
+    @ViewBuilder private func dataTabView(_ tab: DataTab) -> some View {
+        contextBar(tab)
+        Divider().overlay(pal.borderSubtle)
+        content(tab)
     }
 
     // MARK: Tabs
@@ -506,102 +517,7 @@ private struct CenterPane: View {
             center { Image(systemName: "tablecells").font(.system(size: 22)).foregroundColor(pal.textFaint)
                      Text("No rows").font(.ui(13)).foregroundColor(pal.textMuted) }
         } else {
-            dataGrid(tab)
-        }
-    }
-
-    private func dataGrid(_ tab: DataTab) -> some View {
-        let families = tab.columns.map { TypeFamily.from(tab.info(for: $0)?.type ?? "") }
-        let widths = tab.columns.map { colWidth(tab, $0) }
-        return GeometryReader { geo in
-            ScrollView([.horizontal, .vertical]) {
-                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    Section(header: gridHeaderRow(tab, widths: widths)) {
-                        ForEach(Array(tab.rows.enumerated()), id: \.offset) { _, row in
-                            gridRow(row, widths: widths, families: families)
-                        }
-                    }
-                }
-                // Fill at least the viewport so short content top-aligns instead of
-                // sinking to the bottom (macOS combined-axis ScrollView quirk).
-                .frame(minHeight: geo.size.height, alignment: .top)
-            }
-        }
-    }
-
-    private func gridHeaderRow(_ tab: DataTab, widths: [CGFloat]) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(tab.columns.enumerated()), id: \.offset) { idx, name in
-                let info = tab.info(for: name)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        if info?.isPK == true {
-                            Image(systemName: "key.fill").font(.system(size: 8)).foregroundColor(pal.amber500)
-                        }
-                        Text(name)
-                            .font(.mono(11.5, weight: .bold))
-                            .foregroundColor(pal.textPrimary)
-                            .lineLimit(1)
-                    }
-                    if let type = info?.type {
-                        Text(shortType(type))
-                            .font(.mono(9.5, weight: .medium))
-                            .foregroundColor(pal.typeColors(TypeFamily.from(type)).fg)
-                            .lineLimit(1)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .frame(width: widths[idx], height: headerHeight, alignment: .leading)
-                .overlay(alignment: .trailing) {
-                    ColumnResizeHandle(width: widths[idx]) { newWidth in
-                        colWidths[colKey(tab, name)] = newWidth
-                    }
-                }
-            }
-        }
-        .background(pal.surfacePanel)
-        .overlay(Divider().overlay(pal.borderDefault), alignment: .bottom)
-    }
-
-    private func gridRow(_ row: [String?], widths: [CGFloat], families: [TypeFamily]) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(row.enumerated()), id: \.offset) { idx, value in
-                let numeric = idx < families.count && families[idx] == .numeric
-                Group {
-                    if let value {
-                        Text(value)
-                            .font(.mono(12.5))
-                            .foregroundColor(pal.textPrimary)
-                    } else {
-                        Text("NULL")
-                            .font(.mono(11))
-                            .foregroundColor(pal.textFaint)
-                            .italic()
-                    }
-                }
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .padding(.horizontal, 10)
-                .frame(width: idx < widths.count ? widths[idx] : defaultCellWidth,
-                       height: Metrics.rowHeight, alignment: numeric ? .trailing : .leading)
-                .overlay(Divider().overlay(pal.borderSubtle), alignment: .trailing)
-            }
-        }
-        .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
-    }
-
-    /// Compact a Postgres type for the header badge, e.g. "character varying" -> "varchar".
-    private func shortType(_ t: String) -> String {
-        switch t.lowercased() {
-        case "character varying": return "varchar"
-        case "timestamp with time zone": return "timestamptz"
-        case "timestamp without time zone": return "timestamp"
-        case "double precision": return "float8"
-        case "boolean": return "bool"
-        case "integer": return "int4"
-        case "bigint": return "int8"
-        default: return t
+            ResultGrid(gridID: tab.id, columns: tab.columns, columnInfos: tab.columnInfos, rows: tab.rows)
         }
     }
 
@@ -640,55 +556,36 @@ private struct CenterPane: View {
     }
 }
 
-// MARK: - Column resize handle (sits on a header cell's trailing edge)
-
-private struct ColumnResizeHandle: View {
-    @Environment(\.palette) var pal
-    let width: CGFloat
-    let onChange: (CGFloat) -> Void
-
-    @State private var startWidth: CGFloat?
-    @State private var hovering = false
-
-    var body: some View {
-        Rectangle()
-            .fill(Color.clear)
-            .frame(width: 9)
-            .overlay(Rectangle().fill(hovering ? pal.accent : pal.borderSubtle).frame(width: hovering ? 2 : 1))
-            .contentShape(Rectangle())
-            .onHover { inside in
-                hovering = inside
-                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { value in
-                        let base = startWidth ?? width
-                        if startWidth == nil { startWidth = base }
-                        onChange(min(max(base + Double(value.translation.width), 60), 800))
-                    }
-                    .onEnded { _ in startWidth = nil }
-            )
-    }
-}
-
 // MARK: - Center: one open tab
 
 private struct TabChip: View {
     @Environment(\.palette) var pal
-    let tab: DataTab
+    let tab: WorkspaceTab
     let active: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
 
     @State private var hovering = false
 
+    private var icon: String {
+        switch tab {
+        case .data(let t):   return t.relation.kind.iconName
+        case .console:       return "chevron.left.forward.slash.chevron.right"
+        }
+    }
+    private var label: String {
+        switch tab {
+        case .data(let t):      return t.relation.name
+        case .console(let c):   return c.title.isEmpty ? "Query" : c.title
+        }
+    }
+
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: tab.relation.kind.iconName)
+            Image(systemName: icon)
                 .font(.system(size: 11))
                 .foregroundColor(active ? pal.accent : pal.textFaint)
-            Text(tab.relation.name)
+            Text(label)
                 .font(.ui(12))
                 .foregroundColor(active ? pal.textPrimary : pal.textMuted)
                 .lineLimit(1)
