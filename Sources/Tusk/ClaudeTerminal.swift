@@ -54,27 +54,27 @@ struct ClaudeMark: View {
         return t
     }
 
-    /// Keep the panel scrollable even while a full-screen app is running.
+    /// Make the mouse wheel scroll the terminal's scrollback.
     ///
-    /// SwiftTerm's native scrollback only covers the normal screen buffer. Claude
-    /// Code (like `less` or `vim`) draws into the *alternate* buffer, which has no
-    /// scrollback, so the wheel does nothing. Mirroring xterm/iTerm's "alternate
-    /// scroll", we translate wheel motion over the terminal into cursor up/down key
-    /// presses in that case, and otherwise let SwiftTerm handle native scrollback.
+    /// Claude Code renders inline in the normal screen buffer (no alternate
+    /// screen, no mouse reporting), so its history lives in SwiftTerm's
+    /// scrollback. Rather than rely on the embedded view receiving the wheel
+    /// event through the SwiftUI hierarchy, we intercept it at the app level and
+    /// drive SwiftTerm's scrollback directly, which is far more reliable.
     private func installScrollMonitor(for term: LocalProcessTerminalView) {
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak term] event in
             guard let term, event.window === term.window, event.deltaY != 0 else { return event }
             let local = term.convert(event.locationInWindow, from: nil)
             guard term.bounds.contains(local) else { return event }
-            // Normal buffer with history: let SwiftTerm scroll the scrollback.
-            if term.canScroll { return event }
-            // Alternate buffer (full-screen app): send arrow keys instead.
-            let notches = max(1, min(Int(abs(event.deltaY).rounded()), 4))
-            let up = event.deltaY > 0
-            let seq: [UInt8] = term.terminal.applicationCursor
-                ? (up ? EscapeSequences.moveUpApp : EscapeSequences.moveDownApp)
-                : (up ? EscapeSequences.moveUpNormal : EscapeSequences.moveDownNormal)
-            for _ in 0..<notches { term.send(seq) }
+            // Precise (trackpad) deltas are much larger than a mouse notch; scale
+            // them down, and cap so a fast flick doesn't jump the whole buffer.
+            let magnitude = event.hasPreciseScrollingDeltas ? abs(event.scrollingDeltaY) / 6 : abs(event.deltaY)
+            let lines = max(1, min(Int(magnitude.rounded()), 6))
+            if event.deltaY > 0 {
+                term.scrollUp(lines: lines)
+            } else {
+                term.scrollDown(lines: lines)
+            }
             return nil
         }
     }
