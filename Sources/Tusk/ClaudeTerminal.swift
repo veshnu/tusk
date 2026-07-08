@@ -45,6 +45,12 @@ struct ClaudeMark: View {
         var env = ProcessInfo.processInfo.environment
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
+        // Claude Code's fullscreen UI (alternate screen) normally sends incremental
+        // diff frames; under SwiftTerm's scroll-region handling those leave stale,
+        // overlapping cells when the transcript scrolls. Force a full repaint per
+        // frame so redraws are clean. (We forward the wheel to Claude as SGR mouse
+        // events; see installScrollMonitor.)
+        env["CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT"] = "1"
         t.startProcess(executable: shell,
                        args: ["-i", "-l", "-c", "exec claude"],
                        environment: env.map { "\($0)=\($1)" },
@@ -54,26 +60,42 @@ struct ClaudeMark: View {
         return t
     }
 
-    /// Make the mouse wheel scroll the terminal's scrollback.
+    /// Make the mouse wheel scroll the terminal.
     ///
-    /// Claude Code renders inline in the normal screen buffer (no alternate
-    /// screen, no mouse reporting), so its history lives in SwiftTerm's
-    /// scrollback. Rather than rely on the embedded view receiving the wheel
-    /// event through the SwiftUI hierarchy, we intercept it at the app level and
-    /// drive SwiftTerm's scrollback directly, which is far more reliable.
+    /// Claude Code's main UI runs in the alternate screen buffer with mouse
+    /// reporting enabled (`?1049h` + `?1000/1002/1003/1006h`), so it has no
+    /// SwiftTerm scrollback and expects the wheel forwarded to it as mouse
+    /// events. SwiftTerm's built-in wheel handling never forwards to a
+    /// mouse-reporting app, so we do it here: when mouse reporting is on we
+    /// synthesize SGR wheel events at the pointer; otherwise (normal buffer) we
+    /// drive SwiftTerm's own scrollback.
     private func installScrollMonitor(for term: LocalProcessTerminalView) {
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak term] event in
             guard let term, event.window === term.window, event.deltaY != 0 else { return event }
             let local = term.convert(event.locationInWindow, from: nil)
             guard term.bounds.contains(local) else { return event }
+
+            let up = event.deltaY > 0
             // Precise (trackpad) deltas are much larger than a mouse notch; scale
             // them down, and cap so a fast flick doesn't jump the whole buffer.
-            let magnitude = event.hasPreciseScrollingDeltas ? abs(event.scrollingDeltaY) / 6 : abs(event.deltaY)
-            let lines = max(1, min(Int(magnitude.rounded()), 6))
-            if event.deltaY > 0 {
-                term.scrollUp(lines: lines)
+            let magnitude = event.hasPreciseScrollingDeltas ? abs(event.scrollingDeltaY) / 8 : abs(event.deltaY)
+            let notches = max(1, min(Int(magnitude.rounded()), 6))
+
+            guard let t = term.terminal else { return nil }
+            if t.mouseMode != .off {
+                // Alternate-buffer app: forward the wheel as mouse events.
+                let cols = max(t.cols, 1), rows = max(t.rows, 1)
+                let cw = term.bounds.width / CGFloat(cols)
+                let ch = term.bounds.height / CGFloat(rows)
+                let col = min(max(Int(local.x / cw), 0), cols - 1)
+                // The view is not flipped: local.y is measured from the bottom.
+                let row = min(max(Int((term.bounds.height - local.y) / ch), 0), rows - 1)
+                let flags = t.encodeButton(button: up ? 4 : 5, release: false,
+                                           shift: false, meta: false, control: false)
+                for _ in 0..<notches { t.sendEvent(buttonFlags: flags, x: col, y: row) }
             } else {
-                term.scrollDown(lines: lines)
+                // Normal buffer: scroll SwiftTerm's own scrollback.
+                if up { term.scrollUp(lines: notches) } else { term.scrollDown(lines: notches) }
             }
             return nil
         }
