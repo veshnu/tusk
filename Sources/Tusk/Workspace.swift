@@ -7,13 +7,15 @@ struct Workspace: View {
     @Environment(\.palette) var pal
 
     @AppStorage("tusk.railWidth") private var railWidth: Double = 250
+    @AppStorage("tusk.sidebarWidth") private var sidebarWidth: Double = 248
     @AppStorage("tusk.terminalHeight") private var terminalHeight: Double = 300
 
     var body: some View {
         VStack(spacing: 0) {
             TitleBar()
             HStack(spacing: 0) {
-                SchemaSidebar()
+                SchemaSidebar(width: CGFloat(sidebarWidth))
+                ResizeHandle(width: $sidebarWidth, range: 200...480, paneOnLeft: true)
                 VStack(spacing: 0) {
                     CenterPane()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -39,6 +41,9 @@ private struct ResizeHandle: View {
     @Environment(\.palette) var pal
     @Binding var width: Double
     let range: ClosedRange<Double>
+    /// true: the resized pane sits to the handle's left (drag right widens it);
+    /// false: the pane sits to the handle's right (drag left widens it).
+    var paneOnLeft: Bool = false
 
     @State private var dragStartWidth: Double?
     @State private var hovering = false
@@ -62,8 +67,8 @@ private struct ResizeHandle: View {
                     .onChanged { value in
                         let base = dragStartWidth ?? width
                         if dragStartWidth == nil { dragStartWidth = base }
-                        // Handle sits on the pane's left edge: dragging left widens it.
-                        let proposed = base - Double(value.translation.width)
+                        let delta = Double(value.translation.width)
+                        let proposed = paneOnLeft ? base + delta : base - delta
                         width = min(max(proposed, range.lowerBound), range.upperBound)
                     }
                     .onEnded { _ in dragStartWidth = nil }
@@ -167,6 +172,73 @@ private struct TitleBar: View {
         .frame(height: 38)
         .background(pal.surfacePanel)
         .overlay(Divider().overlay(pal.borderDefault), alignment: .bottom)
+        // Vertically center the real macOS traffic lights in this 38pt bar so they
+        // line up with the "Tusk" brand mark (they'd otherwise sit ~5pt higher).
+        .background(TrafficLightAligner(centerFromTop: 19))
+    }
+}
+
+// MARK: - Traffic light vertical alignment
+
+/// Repositions the standard window buttons so their vertical center sits
+/// `centerFromTop` points below the top of the window, matching a custom-height
+/// title bar. Reapplied whenever macOS re-lays the buttons out (resize, key,
+/// full-screen transitions).
+private struct TrafficLightAligner: NSViewRepresentable {
+    let centerFromTop: CGFloat
+
+    func makeCoordinator() -> Coordinator { Coordinator(centerFromTop: centerFromTop) }
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView(frame: .zero)
+        context.coordinator.attach(to: v)
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.reposition()
+    }
+
+    final class Coordinator {
+        let centerFromTop: CGFloat
+        private weak var view: NSView?
+        private var observers: [NSObjectProtocol] = []
+
+        init(centerFromTop: CGFloat) { self.centerFromTop = centerFromTop }
+
+        deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+
+        func attach(to view: NSView) {
+            self.view = view
+            let names: [Notification.Name] = [
+                NSWindow.didResizeNotification,
+                NSWindow.didBecomeKeyNotification,
+                NSWindow.didEndLiveResizeNotification,
+                NSWindow.didEnterFullScreenNotification,
+                NSWindow.didExitFullScreenNotification,
+            ]
+            for name in names {
+                let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.reposition()
+                }
+                observers.append(token)
+            }
+            DispatchQueue.main.async { [weak self] in self?.reposition() }
+        }
+
+        func reposition() {
+            guard let window = view?.window else { return }
+            let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+                .compactMap { window.standardWindowButton($0) }
+            guard let container = buttons.first?.superview else { return }
+            for button in buttons {
+                var frame = button.frame
+                // Titlebar container's top edge coincides with the window top; place
+                // the button's center `centerFromTop` down from there.
+                frame.origin.y = container.bounds.height - centerFromTop - frame.height / 2
+                button.frame = frame
+            }
+        }
     }
 }
 
@@ -176,6 +248,7 @@ private struct SchemaSidebar: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    var width: CGFloat = 248
     @State private var filter = ""
     @State private var collapsedSchemas: Set<String> = []   // keyed "database.schema"
     @State private var serverCollapsed = false
@@ -260,9 +333,8 @@ private struct SchemaSidebar: View {
             .frame(height: 30)
             .overlay(Divider().overlay(pal.borderSubtle), alignment: .top)
         }
-        .frame(width: 248)
+        .frame(width: width)
         .background(pal.surfacePanel)
-        .overlay(Divider().overlay(pal.borderDefault), alignment: .trailing)
     }
 
     /// One database node plus its (lazily-loaded) schemas and relations.

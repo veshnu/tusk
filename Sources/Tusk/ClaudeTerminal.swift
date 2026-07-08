@@ -31,6 +31,7 @@ struct ClaudeMark: View {
 /// the panel (or toggling from the title bar) doesn't kill the running session.
 @MainActor final class TerminalController {
     private var term: LocalProcessTerminalView?
+    private var scrollMonitor: Any?
 
     /// The terminal view, spawning `claude` in a login shell on first use.
     func start(isDark: Bool) -> LocalProcessTerminalView {
@@ -49,7 +50,33 @@ struct ClaudeMark: View {
                        environment: env.map { "\($0)=\($1)" },
                        currentDirectory: TerminalController.workspaceDirectory())
         term = t
+        installScrollMonitor(for: t)
         return t
+    }
+
+    /// Keep the panel scrollable even while a full-screen app is running.
+    ///
+    /// SwiftTerm's native scrollback only covers the normal screen buffer. Claude
+    /// Code (like `less` or `vim`) draws into the *alternate* buffer, which has no
+    /// scrollback, so the wheel does nothing. Mirroring xterm/iTerm's "alternate
+    /// scroll", we translate wheel motion over the terminal into cursor up/down key
+    /// presses in that case, and otherwise let SwiftTerm handle native scrollback.
+    private func installScrollMonitor(for term: LocalProcessTerminalView) {
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak term] event in
+            guard let term, event.window === term.window, event.deltaY != 0 else { return event }
+            let local = term.convert(event.locationInWindow, from: nil)
+            guard term.bounds.contains(local) else { return event }
+            // Normal buffer with history: let SwiftTerm scroll the scrollback.
+            if term.canScroll { return event }
+            // Alternate buffer (full-screen app): send arrow keys instead.
+            let notches = max(1, min(Int(abs(event.deltaY).rounded()), 4))
+            let up = event.deltaY > 0
+            let seq: [UInt8] = term.terminal.applicationCursor
+                ? (up ? EscapeSequences.moveUpApp : EscapeSequences.moveDownApp)
+                : (up ? EscapeSequences.moveUpNormal : EscapeSequences.moveDownNormal)
+            for _ in 0..<notches { term.send(seq) }
+            return nil
+        }
     }
 
     /// The Tusk workspace folder (`~/TuskProjects`), created if it doesn't exist so

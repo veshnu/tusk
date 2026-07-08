@@ -209,7 +209,7 @@ struct ResultGrid: View {
                         }
                     }
                 }
-                .frame(minHeight: geo.size.height, alignment: .top)
+                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
             }
         }
     }
