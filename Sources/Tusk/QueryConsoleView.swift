@@ -348,6 +348,15 @@ struct CellValueViewer: View {
     let onClose: () -> Void
 
     @State private var copied = false
+    @State private var contentSize: CGSize = .zero
+
+    // The viewer hugs its content, only scrolling once it would exceed these caps.
+    private let maxContentWidth: CGFloat = 760
+    private let maxContentHeight: CGFloat = 560
+    private let minContentWidth: CGFloat = 340
+
+    private var contentWidth: CGFloat { min(max(contentSize.width, minContentWidth), maxContentWidth) }
+    private var contentHeight: CGFloat { min(max(contentSize.height, 40), maxContentHeight) }
 
     private var pretty: String {
         let raw = value.value
@@ -393,11 +402,16 @@ struct CellValueViewer: View {
                         .foregroundColor(pal.textPrimary)
                         .textSelection(.enabled)
                         .padding(14)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize()
+                        .background(GeometryReader { g in
+                            Color.clear.preference(key: CellContentSizeKey.self, value: g.size)
+                        })
                 }
+                .frame(width: contentWidth, height: contentHeight)
                 .background(pal.surfaceInset)
             }
-            .frame(width: 620, height: 460)
+            .frame(width: contentWidth)
+            .onPreferenceChange(CellContentSizeKey.self) { contentSize = $0 }
             .background(pal.surfaceRaised)
             .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusLG, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: Metrics.radiusLG, style: .continuous).strokeBorder(pal.borderDefault, lineWidth: 1))
@@ -409,5 +423,14 @@ struct CellValueViewer: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(pretty, forType: .string)
         copied = true
+    }
+}
+
+/// Measures the natural size of the viewer's content so the popup can hug it.
+private struct CellContentSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        value = CGSize(width: max(value.width, next.width), height: max(value.height, next.height))
     }
 }
