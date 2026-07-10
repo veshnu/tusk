@@ -326,6 +326,43 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Delete row `rowIndex` from a data tab's table. Identifies the row by its
+    /// primary-key columns when the table has one, else by all column values.
+    /// On success the row is removed from the tab locally (optimistic).
+    func deleteDataTabRow(_ id: String, rowIndex: Int) {
+        guard case .data(let tab)? = tabs.first(where: { $0.id == id }),
+              rowIndex >= 0, rowIndex < tab.rows.count else { return }
+        let row = tab.rows[rowIndex]
+
+        let pkNames = tab.columnInfos.filter { $0.isPK }.map { $0.name }
+        let keyColumns = pkNames.isEmpty ? tab.columns : pkNames
+        var columns: [String] = []
+        var values: [String?] = []
+        for name in keyColumns {
+            guard let idx = tab.columns.firstIndex(of: name), idx < row.count else { continue }
+            columns.append(name)
+            values.append(row[idx])
+        }
+        guard !columns.isEmpty else {
+            updateDataTab(id) { $0.error = "Cannot delete: no primary key or columns to identify the row." }
+            return
+        }
+
+        Task {
+            do {
+                try await db.tabDeleteRow(tab: id, database: tab.database,
+                                          schema: tab.relation.schema, table: tab.relation.name,
+                                          columns: columns, values: values)
+                updateDataTab(id) {
+                    if rowIndex < $0.rows.count, $0.rows[rowIndex] == row { $0.rows.remove(at: rowIndex) }
+                    $0.error = nil
+                }
+            } catch {
+                updateDataTab(id) { $0.error = error.localizedDescription }
+            }
+        }
+    }
+
     /// Mutate a data tab in place if it still exists (it may have been closed mid-load).
     private func updateDataTab(_ id: String, _ mutate: (inout DataTab) -> Void) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }), case .data(var t) = tabs[idx] else { return }

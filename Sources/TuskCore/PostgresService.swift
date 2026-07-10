@@ -269,6 +269,28 @@ public actor PGConnection {
         return RowSet(columns: res.columns, rows: res.rows)
     }
 
+    /// Delete a single row identified by `columns`/`values` (primary-key columns
+    /// preferred). NULL identifiers match with `IS NULL`; the rest bind as params.
+    /// Returns the number of rows the server actually removed.
+    @discardableResult
+    public func deleteRow(schema: String, table: String, columns: [String], values: [String?]) throws -> Int {
+        let c = try handle()
+        guard !columns.isEmpty else { throw PGError.message("Cannot delete a row without identifying columns.") }
+        var clauses: [String] = []
+        var params: [String?] = []
+        for (col, val) in zip(columns, values) {
+            if let val {
+                clauses.append("\(PGRaw.quoteIdent(col)) = $\(params.count + 1)")
+                params.append(val)
+            } else {
+                clauses.append("\(PGRaw.quoteIdent(col)) IS NULL")
+            }
+        }
+        let sql = "DELETE FROM \(PGRaw.quoteIdent(schema)).\(PGRaw.quoteIdent(table)) WHERE \(clauses.joined(separator: " AND "))"
+        _ = try PGRaw.execParams(c, sql, params)
+        return 1
+    }
+
     /// Run arbitrary SQL on this connection and return the result set. Non-row
     /// statements (INSERT/UPDATE/DDL) come back as an empty `RowSet`. When
     /// `readOnly` is set, the connection is put in a read-only transaction so
@@ -383,6 +405,13 @@ public actor Database {
 
     public func tabRows(tab: String, database: String, schema: String, table: String, limit: Int = 200) async throws -> RowSet {
         try await tabLane(tab, database: database).rows(schema: schema, table: table, limit: limit)
+    }
+
+    /// Delete a row in a data tab's table, on that tab's dedicated lane.
+    public func tabDeleteRow(tab: String, database: String, schema: String, table: String,
+                             columns: [String], values: [String?]) async throws {
+        _ = try await tabLane(tab, database: database)
+            .deleteRow(schema: schema, table: table, columns: columns, values: values)
     }
 
     /// Close and drop a tab's dedicated connection.

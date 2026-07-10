@@ -188,11 +188,19 @@ struct ResultGrid: View {
     let columnInfos: [ColumnInfo]
     let rows: [[String?]]
     var onExpand: ((_ column: String, _ value: String) -> Void)? = nil
+    /// When set, each row shows a trash affordance that (after confirmation) calls
+    /// this with the row index. Left nil for read-only grids (e.g. query consoles).
+    var onDeleteRow: ((_ rowIndex: Int) -> Void)? = nil
 
     private let defaultCellWidth: CGFloat = 180
     private let headerHeight: CGFloat = 44
+    private let gutterWidth: CGFloat = 36
     @State private var colWidths: [String: CGFloat] = [:]
     @State private var hover: String? = nil   // "r|c"
+    @State private var hoverRow: Int? = nil
+    @State private var pendingDelete: Int? = nil
+
+    private var hasRowActions: Bool { onDeleteRow != nil }
 
     private func info(_ name: String) -> ColumnInfo? { columnInfos.first { $0.name == name } }
     private func width(_ name: String) -> CGFloat { colWidths[name] ?? defaultCellWidth }
@@ -212,10 +220,28 @@ struct ResultGrid: View {
                 .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
             }
         }
+        .confirmationDialog("Delete this row?", isPresented: deleteDialogBinding, titleVisibility: .visible) {
+            Button("Delete Row", role: .destructive) {
+                if let r = pendingDelete { onDeleteRow?(r) }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text("This permanently deletes the row from the database and cannot be undone.")
+        }
+    }
+
+    private var deleteDialogBinding: Binding<Bool> {
+        Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })
     }
 
     private func headerRow(widths: [CGFloat]) -> some View {
         HStack(spacing: 0) {
+            if hasRowActions {
+                Color.clear
+                    .frame(width: gutterWidth, height: headerHeight)
+                    .overlay(Divider().overlay(pal.borderDefault), alignment: .trailing)
+            }
             ForEach(Array(columns.enumerated()), id: \.offset) { idx, name in
                 let ci = info(name)
                 VStack(alignment: .leading, spacing: 2) {
@@ -244,6 +270,23 @@ struct ResultGrid: View {
 
     private func bodyRow(_ r: Int, _ row: [String?], widths: [CGFloat], families: [TypeFamily]) -> some View {
         HStack(spacing: 0) {
+            if hasRowActions {
+                // A tap-gesture view rather than a Button: a SwiftUI Button is an AppKit
+                // control that installs its own hover tracking and steals the row's hover,
+                // making the icon flicker away as the cursor reaches it. A gesture doesn't.
+                Image(systemName: "trash")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(pal.danger)
+                    .frame(width: 22, height: 22)
+                    .background(RoundedRectangle(cornerRadius: Metrics.radiusXS).fill(pal.danger.opacity(0.12)))
+                    .overlay(RoundedRectangle(cornerRadius: Metrics.radiusXS).strokeBorder(pal.danger.opacity(0.30), lineWidth: 1))
+                    .opacity(hoverRow == r ? 1 : 0)
+                    .frame(width: gutterWidth, height: Metrics.rowHeight)
+                    .overlay(Divider().overlay(pal.borderSubtle), alignment: .trailing)
+                    .contentShape(Rectangle())
+                    .onTapGesture { if hoverRow == r { pendingDelete = r } }
+                    .help("Delete row")
+            }
             ForEach(Array(row.enumerated()), id: \.offset) { idx, value in
                 let name = idx < columns.count ? columns[idx] : "\(idx)"
                 let family = idx < families.count ? families[idx] : .other
@@ -283,6 +326,9 @@ struct ResultGrid: View {
             }
         }
         .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+        .onHover { inside in
+            if inside { hoverRow = r } else if hoverRow == r { hoverRow = nil }
+        }
     }
 
     /// JSON/JSONB, or text long enough (or content that looks like JSON) to be worth a viewer.

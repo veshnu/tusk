@@ -593,7 +593,8 @@ private struct CenterPane: View {
                      Text("No rows").font(.ui(13)).foregroundColor(pal.textMuted) }
         } else {
             ResultGrid(gridID: tab.id, columns: tab.columns, columnInfos: tab.columnInfos, rows: tab.rows,
-                       onExpand: { col, val in expanded = ExpandedValue(column: col, value: val) })
+                       onExpand: { col, val in expanded = ExpandedValue(column: col, value: val) },
+                       onDeleteRow: isDeletable(tab) ? { model.deleteDataTabRow(tab.id, rowIndex: $0) } : nil)
         }
     }
 
@@ -619,6 +620,11 @@ private struct CenterPane: View {
     private func center<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(spacing: 10) { content() }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Only base and partitioned tables support row deletes — views/matviews don't.
+    private func isDeletable(_ tab: DataTab) -> Bool {
+        tab.relation.kind == .table || tab.relation.kind == .partitioned
     }
 
     private func kindLabel(_ k: DBObjectKind) -> String {
