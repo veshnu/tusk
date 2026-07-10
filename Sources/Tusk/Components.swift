@@ -1,5 +1,44 @@
 import SwiftUI
 
+// MARK: - Tusk brand mark
+
+/// The app's icon, distilled: an ivory tusk on the azure gradient rounded square.
+/// Mirrors `packaging/makeicon.swift` so the title-bar mark matches the dock icon.
+struct TuskMark: View {
+    var size: CGFloat = 15
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.2237, style: .continuous)
+                .fill(LinearGradient(colors: [Color(hex: 0x2E93FF), Color(hex: 0x0057C4)],
+                                     startPoint: .top, endPoint: .bottom))
+            TuskShape().fill(Color.white)
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// The tapered crescent tusk. Control points come straight from the icon renderer,
+/// remapped out of the icon's 9% margin so the crescent fills this rounded square
+/// the same way it fills the dock icon's body.
+private struct TuskShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        // Icon coords are fractions of the full canvas; the body is inset 9% on each
+        // side. Remap full-canvas fractions into body-relative fractions.
+        func P(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + (x - 0.09) / 0.82 * rect.width,
+                    y: rect.minY + (y - 0.09) / 0.82 * rect.height)
+        }
+        var p = Path()
+        p.move(to: P(0.585, 0.200))                                          // tip
+        p.addCurve(to: P(0.335, 0.740), control1: P(0.360, 0.280), control2: P(0.280, 0.520)) // outer edge
+        p.addCurve(to: P(0.485, 0.775), control1: P(0.370, 0.830), control2: P(0.450, 0.830)) // rounded base
+        p.addCurve(to: P(0.585, 0.200), control1: P(0.475, 0.520), control2: P(0.550, 0.300)) // inner edge
+        p.closeSubpath()
+        return p
+    }
+}
+
 // MARK: - Status dot
 
 struct StatusDot: View {

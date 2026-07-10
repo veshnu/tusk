@@ -88,9 +88,7 @@ private struct TitleBar: View {
             Spacer().frame(width: 62)
 
             HStack(spacing: 7) {
-                Image(systemName: "hexagon.fill")
-                    .font(.system(size: 13))
-                    .foregroundColor(pal.accent)
+                TuskMark(size: 15)
                 Text("Tusk")
                     .font(.ui(13, weight: .semibold))
                     .foregroundColor(pal.textPrimary)
