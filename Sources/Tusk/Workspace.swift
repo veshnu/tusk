@@ -593,7 +593,7 @@ private struct CenterPane: View {
                      Text("No rows").font(.ui(13)).foregroundColor(pal.textMuted) }
         } else {
             ResultGrid(gridID: tab.id, columns: tab.columns, columnInfos: tab.columnInfos, rows: tab.rows,
-                       onExpand: { col, val in expanded = ExpandedValue(column: col, value: val) },
+                       onExpand: { col, type, val in expanded = ExpandedValue(column: col, type: type, value: val) },
                        onDeleteRow: isDeletable(tab) ? { model.deleteDataTabRow(tab.id, rowIndex: $0) } : nil)
         }
     }
