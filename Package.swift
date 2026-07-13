@@ -12,6 +12,10 @@ let package = Package(
         .executable(name: "Tusk", targets: ["Tusk"]),      // GUI app
         .executable(name: "tuskcli", targets: ["tuskcli"]), // CLI (installed as `tusk`)
     ],
+    dependencies: [
+        // Embedded terminal (PTY + xterm emulator) for the Claude Code panel.
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.2.0"),
+    ],
     targets: [
         .systemLibrary(name: "CPostgres", path: "Sources/CPostgres"),
 
@@ -27,7 +31,7 @@ let package = Package(
         // GUI application.
         .executableTarget(
             name: "Tusk",
-            dependencies: ["TuskCore"],
+            dependencies: ["TuskCore", .product(name: "SwiftTerm", package: "SwiftTerm")],
             linkerSettings: [.unsafeFlags(["-L", libpqLib])]
         ),
 

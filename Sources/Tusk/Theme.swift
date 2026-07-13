@@ -78,8 +78,13 @@ struct Palette {
     var accentHover: Color { isDark ? Color(hex: 0x409CFF) : Color(hex: 0x1A88FF) }
     var accentPress: Color { isDark ? Color(hex: 0x007AFF) : Color(hex: 0x0062CC) }
     var azure400: Color { Color(hex: 0x0A84FF) }
+    var azure500: Color { Color(hex: 0x007AFF) }
     var azure600: Color { Color(hex: 0x0062CC) }
+    var amber400: Color { Color(hex: 0xFF9F0A) }
     var amber500: Color { Color(hex: 0xFF9500) }
+
+    /// Accent wash used behind active/selected rows in menus, completions, cells.
+    var accentSubtle: Color { isDark ? Color(hex: 0x0A84FF, alpha: 0.18) : Color(hex: 0x007AFF, alpha: 0.10) }
 
     // Semantic status
     var success: Color { isDark ? Color(hex: 0x30D158) : Color(hex: 0x248A3D) }
@@ -117,6 +122,20 @@ struct Palette {
             return isDark ? (Color(hex: 0xFFFFFF, alpha: 0.08), Color(hex: 0x98989D))
                           : (Color(hex: 0x000000, alpha: 0.05), Color(hex: 0x6E6E73))
         }
+    }
+
+    // SQL syntax highlighting (Xcode "Default" flavor, per DS tokens/semantic.css)
+    struct Syntax {
+        let keyword, function, string, number, boolean, comment, table, identifier, oper, punct: Color
+    }
+    var syntax: Syntax {
+        isDark
+        ? Syntax(keyword: Color(hex: 0xFF7AB2), function: Color(hex: 0x67B7A4), string: Color(hex: 0xFF8170),
+                 number: Color(hex: 0xD9C97C), boolean: Color(hex: 0xDABAFF), comment: Color(hex: 0x7F8C98),
+                 table: Color(hex: 0xD9A2FF), identifier: textPrimary, oper: textSecondary, punct: textMuted)
+        : Syntax(keyword: Color(hex: 0x9B2393), function: Color(hex: 0x3E8087), string: Color(hex: 0xC41A16),
+                 number: Color(hex: 0x1C00CF), boolean: Color(hex: 0x5C2699), comment: Color(hex: 0x5D6C79),
+                 table: Color(hex: 0x5C2699), identifier: textPrimary, oper: textSecondary, punct: textMuted)
     }
 
     // Env badge color (production/staging/local)

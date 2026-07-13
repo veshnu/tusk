@@ -61,6 +61,65 @@ final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
         return try await db.columns(database: dbName, schema: schema, table: table)
     }
 
+    // MARK: Query consoles (driving the GUI from MCP)
+
+    func createQueryConsole(databaseId: String, sql: String?) async throws -> String {
+        let (connId, dbName) = try TuskID.splitDatabase(databaseId)
+        try await requireActive(connId)
+        let id = await MainActor.run { model?.openConsole(connectionId: connId, database: dbName, seedSQL: sql) }
+        guard let id else { throw MCPError.notConnected("Tusk is not running.") }
+        return id
+    }
+
+    func listQueryConsoles() async -> [ConsoleInfo] {
+        await MainActor.run {
+            let sel = model?.activeConsole?.id
+            return (model?.consoles ?? []).map {
+                ConsoleInfo(id: $0.id, database: $0.database, title: $0.title, selected: $0.id == sel)
+            }
+        }
+    }
+
+    func selectedQueryConsole() async -> String? {
+        await MainActor.run { model?.activeConsole?.id }
+    }
+
+    func selectQueryConsole(consoleId: String) async throws {
+        try await MainActor.run {
+            guard let model, model.console(consoleId) != nil else { throw MCPError.notFound("query console \(consoleId)") }
+            model.focusTab(consoleId)
+        }
+    }
+
+    func getQueryConsole(consoleId: String) async throws -> ConsoleDetail {
+        try await detail(consoleId)
+    }
+
+    func setQueryConsoleSQL(consoleId: String, sql: String) async throws -> ConsoleDetail {
+        try await MainActor.run {
+            guard let model, model.console(consoleId) != nil else { throw MCPError.notFound("query console \(consoleId)") }
+            model.setConsoleSQL(consoleId, sql: sql)
+        }
+        return try await detail(consoleId)
+    }
+
+    func runQueryConsole(consoleId: String) async throws -> ConsoleDetail {
+        let exists = await MainActor.run { model?.console(consoleId) != nil }
+        guard exists else { throw MCPError.notFound("query console \(consoleId)") }
+        guard let model else { throw MCPError.notConnected("Tusk is not running.") }
+        await model.runConsoleAwait(consoleId, byClaude: true)
+        return try await detail(consoleId)
+    }
+
+    /// Build the DTO from the live console (full rows; the session caps for transport).
+    private func detail(_ id: String) async throws -> ConsoleDetail {
+        try await MainActor.run {
+            guard let c = model?.console(id) else { throw MCPError.notFound("query console \(id)") }
+            return ConsoleDetail(id: c.id, database: c.database, title: c.title, sql: c.sql,
+                                 columns: c.columns, rows: c.rows, error: c.error, running: c.running)
+        }
+    }
+
     // MARK: Helpers
 
     private func requireActive(_ connectionId: String) async throws {

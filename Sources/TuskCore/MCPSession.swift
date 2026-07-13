@@ -14,6 +14,11 @@ public enum TuskPaths {
     public static var mcpSocketPath: String {
         appSupportDir + "/mcp.sock"
     }
+
+    /// Where per-console SQL buffers and their restore index live on disk.
+    public static var consolesDir: String {
+        appSupportDir + "/consoles"
+    }
 }
 
 // MARK: - Errors
@@ -150,9 +155,58 @@ public actor MCPSession {
             }
             return jsonText(["databaseId": databaseId, "tableId": tableId, "columns": out])
 
+        case "create_query_console":
+            let databaseId = try requiredString("database_id")
+            let sql = args["sql"] as? String
+            let id = try await provider.createQueryConsole(databaseId: databaseId, sql: sql)
+            return jsonText(["console_id": id])
+
+        case "list_query_consoles":
+            let consoles = await provider.listQueryConsoles()
+            let out = consoles.map {
+                ["id": $0.id, "database": $0.database, "title": $0.title, "selected": $0.selected] as [String: Any]
+            }
+            return jsonText(["consoles": out])
+
+        case "get_selected_query_console":
+            let id = await provider.selectedQueryConsole()
+            return jsonText(["console_id": id.map { $0 as Any } ?? NSNull()])
+
+        case "select_query_console":
+            let id = try requiredString("console_id")
+            try await provider.selectQueryConsole(consoleId: id)
+            return jsonText(["console_id": id, "selected": true])
+
+        case "get_query_console":
+            let id = try requiredString("console_id")
+            return Self.consoleDetailJSON(try await provider.getQueryConsole(consoleId: id))
+
+        case "set_query_console_sql":
+            let id = try requiredString("console_id")
+            let sql = args["sql"] as? String ?? ""   // empty clears the buffer
+            return Self.consoleDetailJSON(try await provider.setQueryConsoleSQL(consoleId: id, sql: sql))
+
+        case "run_query_console":
+            let id = try requiredString("console_id")
+            return Self.consoleDetailJSON(try await provider.runQueryConsole(consoleId: id))
+
         default:
             throw MCPError.unknownTool(name)
         }
+    }
+
+    /// Serialize a console's state for MCP, capping rows so a huge result set doesn't
+    /// flood the transport (the full grid still lives in the app).
+    private static func consoleDetailJSON(_ d: ConsoleDetail) -> String {
+        let cap = 200
+        let capped = d.rows.prefix(cap).map { row in row.map { $0 ?? NSNull() } as [Any] }
+        var obj: [String: Any] = [
+            "console_id": d.id, "database": d.database, "title": d.title, "sql": d.sql,
+            "columns": d.columns, "rows": capped, "row_count": d.rows.count, "running": d.running,
+        ]
+        if d.rows.count > cap { obj["truncated"] = true; obj["returned_rows"] = cap }
+        if let e = d.error { obj["error"] = e }
+        return jsonText(obj)
     }
 
     // MARK: Tool schemas advertised to the client
@@ -193,6 +247,72 @@ public actor MCPSession {
                     "table_id": ["type": "string", "description": "A table id from list_tables (\"schema.table\")."],
                 ],
                 "required": ["database_id", "table_id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "create_query_console",
+            "description": "Open a new SQL query console tab in Tusk, bound to a database's connection. Returns its console_id. Optionally seed the editor with SQL. The console appears and is focused in the app.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "database_id": ["type": "string", "description": "A database id from list_databases (\"<connection_id>/<database>\")."],
+                    "sql": ["type": "string", "description": "Optional SQL to seed the editor with."],
+                ],
+                "required": ["database_id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "list_query_consoles",
+            "description": "List the query consoles currently open in Tusk, including which one is selected (focused).",
+            "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
+        ],
+        [
+            "name": "get_selected_query_console",
+            "description": "Return the console_id of the currently selected (focused) query console, or null if none is focused.",
+            "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
+        ],
+        [
+            "name": "select_query_console",
+            "description": "Focus an existing query console tab in Tusk.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["console_id": ["type": "string", "description": "A console id from list_query_consoles."]],
+                "required": ["console_id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "get_query_console",
+            "description": "Get a query console's current SQL buffer and its latest results (columns, rows, error, running state).",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["console_id": ["type": "string", "description": "A console id from list_query_consoles."]],
+                "required": ["console_id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "set_query_console_sql",
+            "description": "Replace a query console's SQL buffer — like editing the open file in an editor. Reflects live in Tusk's editor. Returns the console's updated state.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "console_id": ["type": "string", "description": "A console id from list_query_consoles."],
+                    "sql": ["type": "string", "description": "The new SQL contents of the editor (empty string clears it)."],
+                ],
+                "required": ["console_id", "sql"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "run_query_console",
+            "description": "Run a query console's current SQL on its dedicated connection. The run happens in the visible console tab (attributed to Claude) and the results are returned (rows capped for transport).",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["console_id": ["type": "string", "description": "A console id from list_query_consoles."]],
+                "required": ["console_id"],
                 "additionalProperties": false,
             ],
         ],

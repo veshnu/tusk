@@ -1,22 +1,78 @@
 import SwiftUI
+import AppKit
 import TuskCore
 
 struct Workspace: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    @AppStorage("tusk.railWidth") private var railWidth: Double = 250
+    @AppStorage("tusk.sidebarWidth") private var sidebarWidth: Double = 248
+    @AppStorage("tusk.terminalHeight") private var terminalHeight: Double = 300
+
     var body: some View {
         VStack(spacing: 0) {
             TitleBar()
             HStack(spacing: 0) {
-                SchemaSidebar()
-                TableDetail()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                InfoRail()
+                SchemaSidebar(width: CGFloat(sidebarWidth))
+                ResizeHandle(width: $sidebarWidth, range: 200...480, paneOnLeft: true)
+                VStack(spacing: 0) {
+                    CenterPane()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if model.showTerminal {
+                        TerminalResizeBar(height: $terminalHeight, range: 140...640)
+                        ClaudeTerminalPanel()
+                            .frame(height: CGFloat(terminalHeight))
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ResizeHandle(width: $railWidth, range: 200...520)
+                InfoRail(width: CGFloat(railWidth))
             }
         }
         .background(pal.surfaceApp)
         .ignoresSafeArea(.container, edges: .top)
+    }
+}
+
+// MARK: - Draggable resize handle (grows the pane to its right)
+
+private struct ResizeHandle: View {
+    @Environment(\.palette) var pal
+    @Binding var width: Double
+    let range: ClosedRange<Double>
+    /// true: the resized pane sits to the handle's left (drag right widens it);
+    /// false: the pane sits to the handle's right (drag left widens it).
+    var paneOnLeft: Bool = false
+
+    @State private var dragStartWidth: Double?
+    @State private var hovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: 7)
+            .overlay(
+                Rectangle()
+                    .fill(hovering ? pal.accent : pal.borderDefault)
+                    .frame(width: hovering ? 2 : 1)
+            )
+            .contentShape(Rectangle())
+            .onHover { inside in
+                hovering = inside
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        let base = dragStartWidth ?? width
+                        if dragStartWidth == nil { dragStartWidth = base }
+                        let delta = Double(value.translation.width)
+                        let proposed = paneOnLeft ? base + delta : base - delta
+                        width = min(max(proposed, range.lowerBound), range.upperBound)
+                    }
+                    .onEnded { _ in dragStartWidth = nil }
+            )
     }
 }
 
@@ -32,15 +88,36 @@ private struct TitleBar: View {
             Spacer().frame(width: 62)
 
             HStack(spacing: 7) {
-                Image(systemName: "hexagon.fill")
-                    .font(.system(size: 13))
-                    .foregroundColor(pal.accent)
+                TuskMark(size: 15)
                 Text("Tusk")
                     .font(.ui(13, weight: .semibold))
                     .foregroundColor(pal.textPrimary)
             }
 
             Spacer()
+
+            // Claude Code terminal toggle
+            Button {
+                model.toggleTerminal()
+            } label: {
+                HStack(spacing: 6) {
+                    ClaudeMark(size: 13)
+                    Text("Claude Code")
+                        .font(.ui(12))
+                        .foregroundColor(model.showTerminal ? pal.accent : pal.textSecondary)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
+                        .fill(model.showTerminal ? pal.accent.opacity(0.12) : pal.surfaceCard)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
+                        .strokeBorder(model.showTerminal ? pal.accent.opacity(0.35) : pal.borderDefault, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
 
             // Connection switcher / disconnect
             Menu {
@@ -53,7 +130,7 @@ private struct TitleBar: View {
                 } label: { Label("Disconnect", systemImage: "bolt.horizontal.circle") }
             } label: {
                 HStack(spacing: 8) {
-                    StatusDot(status: "connected", size: 7)
+                    StatusDot(status: model.connectionStatus, size: 7)
                     Text(model.activeConn?.name ?? "—")
                         .font(.ui(12))
                         .foregroundColor(pal.textSecondary)
@@ -93,6 +170,73 @@ private struct TitleBar: View {
         .frame(height: 38)
         .background(pal.surfacePanel)
         .overlay(Divider().overlay(pal.borderDefault), alignment: .bottom)
+        // Vertically center the real macOS traffic lights in this 38pt bar so they
+        // line up with the "Tusk" brand mark (they'd otherwise sit ~5pt higher).
+        .background(TrafficLightAligner(centerFromTop: 19))
+    }
+}
+
+// MARK: - Traffic light vertical alignment
+
+/// Repositions the standard window buttons so their vertical center sits
+/// `centerFromTop` points below the top of the window, matching a custom-height
+/// title bar. Reapplied whenever macOS re-lays the buttons out (resize, key,
+/// full-screen transitions).
+private struct TrafficLightAligner: NSViewRepresentable {
+    let centerFromTop: CGFloat
+
+    func makeCoordinator() -> Coordinator { Coordinator(centerFromTop: centerFromTop) }
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView(frame: .zero)
+        context.coordinator.attach(to: v)
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.reposition()
+    }
+
+    final class Coordinator {
+        let centerFromTop: CGFloat
+        private weak var view: NSView?
+        private var observers: [NSObjectProtocol] = []
+
+        init(centerFromTop: CGFloat) { self.centerFromTop = centerFromTop }
+
+        deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+
+        func attach(to view: NSView) {
+            self.view = view
+            let names: [Notification.Name] = [
+                NSWindow.didResizeNotification,
+                NSWindow.didBecomeKeyNotification,
+                NSWindow.didEndLiveResizeNotification,
+                NSWindow.didEnterFullScreenNotification,
+                NSWindow.didExitFullScreenNotification,
+            ]
+            for name in names {
+                let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.reposition()
+                }
+                observers.append(token)
+            }
+            DispatchQueue.main.async { [weak self] in self?.reposition() }
+        }
+
+        func reposition() {
+            guard let window = view?.window else { return }
+            let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+                .compactMap { window.standardWindowButton($0) }
+            guard let container = buttons.first?.superview else { return }
+            for button in buttons {
+                var frame = button.frame
+                // Titlebar container's top edge coincides with the window top; place
+                // the button's center `centerFromTop` down from there.
+                frame.origin.y = container.bounds.height - centerFromTop - frame.height / 2
+                button.frame = frame
+            }
+        }
     }
 }
 
@@ -102,6 +246,7 @@ private struct SchemaSidebar: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    var width: CGFloat = 248
     @State private var filter = ""
     @State private var collapsedSchemas: Set<String> = []   // keyed "database.schema"
     @State private var serverCollapsed = false
@@ -152,9 +297,11 @@ private struct SchemaSidebar: View {
                     } else {
                         // Server node (user@host)
                         TreeRow(depth: 0, icon: "server.rack", label: model.serverLabel,
-                                trailing: nil, selected: false, expandable: true, expanded: !serverCollapsed) {
-                            serverCollapsed.toggle()
-                        } onSelect: { serverCollapsed.toggle() }
+                                trailing: nil, selected: model.inspector == .server,
+                                expandable: true, expanded: !serverCollapsed,
+                                onToggle: { serverCollapsed.toggle() },
+                                onSelect: { model.selectServer() },
+                                onOpen: { serverCollapsed.toggle() })
 
                         if !serverCollapsed {
                             ForEach(model.databases, id: \.self) { dbName in
@@ -184,9 +331,8 @@ private struct SchemaSidebar: View {
             .frame(height: 30)
             .overlay(Divider().overlay(pal.borderSubtle), alignment: .top)
         }
-        .frame(width: 248)
+        .frame(width: width)
         .background(pal.surfacePanel)
-        .overlay(Divider().overlay(pal.borderDefault), alignment: .trailing)
     }
 
     /// One database node plus its (lazily-loaded) schemas and relations.
@@ -195,10 +341,16 @@ private struct SchemaSidebar: View {
         let isActive = dbName == model.activeConn?.database
 
         TreeRow(depth: 1, icon: "cylinder.split.1x2", label: dbName,
-                trailing: nil, selected: false, expandable: true, expanded: dbExpanded,
-                muted: !isActive) {
-            model.toggleDatabase(dbName)
-        } onSelect: { model.toggleDatabase(dbName) }
+                trailing: nil, selected: model.inspector == .database(dbName),
+                expandable: true, expanded: dbExpanded, muted: !isActive,
+                onToggle: { model.toggleDatabase(dbName) },
+                onSelect: { model.selectDatabase(dbName) },
+                onOpen: { model.toggleDatabase(dbName) })
+            .contextMenu {
+                Button {
+                    model.openConsole(database: dbName)
+                } label: { Label("New Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
+            }
 
         if dbExpanded {
             if model.loadingDatabases.contains(dbName) {
@@ -218,9 +370,10 @@ private struct SchemaSidebar: View {
                     let expanded = !collapsedSchemas.contains(key)
                     TreeRow(depth: 2, icon: "shippingbox", label: group.schema,
                             trailing: "\(group.relations.count)", selected: false,
-                            expandable: true, expanded: expanded) {
-                        toggleSchema(key)
-                    } onSelect: { toggleSchema(key) }
+                            expandable: true, expanded: expanded,
+                            onToggle: { toggleSchema(key) },
+                            onSelect: { model.selectDatabase(dbName) },
+                            onOpen: { toggleSchema(key) })
 
                     if expanded {
                         ForEach(group.relations) { rel in
@@ -228,10 +381,19 @@ private struct SchemaSidebar: View {
                                     trailing: (rel.kind == .table || rel.kind == .partitioned) ? Fmt.rows(rel.estRows) : nil,
                                     selected: model.selectedDatabase == dbName && model.selectedRelationID == rel.id,
                                     expandable: false, expanded: false,
-                                    muted: rel.kind == .function) {
-                            } onSelect: {
-                                model.select(database: dbName, relation: rel)
-                            }
+                                    muted: rel.kind == .function,
+                                    onToggle: {},
+                                    onSelect: { model.select(database: dbName, relation: rel) },
+                                    onOpen: { model.openTable(database: dbName, relation: rel) })
+                                .contextMenu {
+                                    Button {
+                                        model.openTable(database: dbName, relation: rel)
+                                    } label: { Label("Open Table", systemImage: "tablecells") }
+                                    Button {
+                                        model.openConsole(database: dbName,
+                                                          seedSQL: "SELECT * FROM \(rel.schema).\(rel.name) LIMIT 100")
+                                    } label: { Label("Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
+                                }
                         }
                     }
                 }
@@ -290,6 +452,7 @@ private struct TreeRow: View {
     var muted: Bool = false
     let onToggle: () -> Void
     let onSelect: () -> Void
+    var onOpen: () -> Void = {}
 
     @State private var hovering = false
 
@@ -338,106 +501,128 @@ private struct TreeRow: View {
                 .padding(.horizontal, 4)
         )
         .contentShape(Rectangle())
-        .onTapGesture(perform: onSelect)
+        .onTapGesture(count: 2, perform: onOpen)
+        .onTapGesture(count: 1, perform: onSelect)
         .onHover { hovering = $0 }
     }
 }
 
-// MARK: - Center: table detail
+// MARK: - Center: welcome / table data
 
-private struct TableDetail: View {
+private struct CenterPane: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    @State private var expanded: ExpandedValue?
+
     var body: some View {
         VStack(spacing: 0) {
-            if let rel = model.selectedRelation {
-                header(rel)
-                columnsHeader
-                Divider().overlay(pal.borderSubtle)
-                if model.loadingColumns {
-                    center { ProgressView().controlSize(.small); Text("Loading columns…").font(.ui(13)).foregroundColor(pal.textMuted) }
-                } else if model.columns.isEmpty {
-                    center { Image(systemName: "tablecells").font(.system(size: 22)).foregroundColor(pal.textFaint)
-                             Text("No columns").font(.ui(13)).foregroundColor(pal.textMuted) }
-                } else {
-                    columnList
-                }
+            if model.tabs.isEmpty {
+                welcome
             } else {
-                emptyState
+                tabBar
+                Divider().overlay(pal.borderDefault)
+                if let tab = model.activeTab {
+                    switch tab {
+                    case .data(let t):    dataTabView(t)
+                    case .console(let c): ConsolePane(console: c).id(c.id)
+                    }
+                }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(pal.surfaceRaised)
+        .overlay { if let e = expanded { CellValueViewer(value: e) { expanded = nil } } }
+    }
+
+    @ViewBuilder private func dataTabView(_ tab: DataTab) -> some View {
+        contextBar(tab)
+        Divider().overlay(pal.borderSubtle)
+        content(tab)
+    }
+
+    // MARK: Tabs
+
+    private var tabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                ForEach(model.tabs) { tab in
+                    TabChip(tab: tab,
+                            active: tab.id == model.activeTabID,
+                            onSelect: { model.focusTab(tab.id) },
+                            onClose: { model.closeTab(tab.id) })
+                }
+            }
+        }
+        .frame(height: Metrics.tabbarHeight)
+        .background(pal.surfacePanel)
+    }
+
+    private func contextBar(_ tab: DataTab) -> some View {
+        HStack(spacing: 8) {
+            Text(tab.relation.schema).font(.mono(11.5)).foregroundColor(pal.textMuted)
+            Text("/").font(.mono(11.5)).foregroundColor(pal.textFaint)
+            Text(tab.relation.name).font(.mono(11.5, weight: .semibold)).foregroundColor(pal.textPrimary)
+            Badge(text: kindLabel(tab.relation.kind), color: pal.textMuted)
+            Spacer()
+            if !tab.loading && tab.error == nil {
+                Badge(text: "\(tab.rows.count) rows", color: pal.textMuted, mono: true)
+            }
+            Button { model.reloadTab(tab.id) } label: {
+                Image(systemName: "arrow.clockwise").font(.system(size: 12)).foregroundColor(pal.textMuted)
+                    .frame(width: 26, height: 24)
+            }.buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 40)
         .background(pal.surfaceRaised)
     }
 
-    private func header(_ rel: Relation) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: rel.kind.iconName)
-                .font(.system(size: 15))
-                .foregroundColor(pal.textSecondary)
-            Text(rel.schema).font(.ui(15)).foregroundColor(pal.textMuted)
-            Text("/").font(.ui(15)).foregroundColor(pal.textFaint)
-            Text(rel.name).font(.ui(15, weight: .semibold)).foregroundColor(pal.textPrimary)
-            Badge(text: kindLabel(rel.kind), color: pal.textMuted)
-            Spacer()
-            if rel.kind == .table || rel.kind == .partitioned {
-                Badge(text: "~\(Fmt.rows(rel.estRows)) rows", color: pal.textMuted, mono: true)
+    // MARK: Active tab content
+
+    @ViewBuilder private func content(_ tab: DataTab) -> some View {
+        if tab.loading {
+            center { ProgressView().controlSize(.small); Text("Loading data…").font(.ui(13)).foregroundColor(pal.textMuted) }
+        } else if let err = tab.error {
+            center { Image(systemName: "exclamationmark.triangle").font(.system(size: 22)).foregroundColor(pal.danger)
+                     Text(err).font(.mono(12)).foregroundColor(pal.danger).multilineTextAlignment(.center) }
+        } else if tab.columns.isEmpty {
+            center { Image(systemName: "tablecells").font(.system(size: 22)).foregroundColor(pal.textFaint)
+                     Text("No rows").font(.ui(13)).foregroundColor(pal.textMuted) }
+        } else {
+            ResultGrid(gridID: tab.id, columns: tab.columns, columnInfos: tab.columnInfos, rows: tab.rows,
+                       onExpand: { col, type, val in expanded = ExpandedValue(column: col, type: type, value: val) },
+                       onDeleteRow: isDeletable(tab) ? { model.deleteDataTabRow(tab.id, rowIndex: $0) } : nil)
+        }
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "hexagon.fill")
+                .font(.system(size: 34))
+                .foregroundColor(pal.accent)
+            Text("Welcome to Tusk")
+                .font(.ui(17, weight: .semibold))
+                .foregroundColor(pal.textPrimary)
+            VStack(spacing: 4) {
+                Text("Single-click an object in the explorer to inspect it.")
+                Text("Double-click a table to open it in a new tab.")
             }
-            Button { model.refreshSchema() } label: {
-                Image(systemName: "arrow.clockwise").font(.system(size: 13)).foregroundColor(pal.textMuted)
-                    .frame(width: 28, height: 26)
-            }.buttonStyle(.plain)
-        }
-        .padding(.horizontal, 16)
-        .frame(height: Metrics.toolbarHeight)
-        .background(pal.surfacePanel)
-        .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
-    }
-
-    private var columnsHeader: some View {
-        HStack {
-            Text("COLUMNS")
-                .font(.ui(10, weight: .semibold)).tracking(0.6)
-                .foregroundColor(pal.textFaint)
-            Spacer()
-            Text("\(model.columns.count)")
-                .font(.mono(11)).foregroundColor(pal.textFaint)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
-    }
-
-    private var columnList: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(Array(model.columns.enumerated()), id: \.element.id) { idx, col in
-                    ColumnRow(col: col, zebra: idx % 2 == 1)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 12)
-        }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "cylinder.split.1x2")
-                .font(.system(size: 30))
-                .foregroundColor(pal.textFaint)
-            Text("Select a table")
-                .font(.ui(15, weight: .medium))
-                .foregroundColor(pal.textSecondary)
-            Text("Pick an object from the explorer to see its columns.")
-                .font(.ui(12))
-                .foregroundColor(pal.textMuted)
+            .font(.ui(12.5))
+            .foregroundColor(pal.textMuted)
+            .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func center<C: View>(@ViewBuilder _ content: () -> C) -> some View {
-        HStack(spacing: 10) { content() }
+        VStack(spacing: 10) { content() }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Only base and partitioned tables support row deletes — views/matviews don't.
+    private func isDeletable(_ tab: DataTab) -> Bool {
+        tab.relation.kind == .table || tab.relation.kind == .partitioned
     }
 
     private func kindLabel(_ k: DBObjectKind) -> String {
@@ -448,6 +633,63 @@ private struct TableDetail: View {
         case .partitioned: return "partitioned"
         default: return "object"
         }
+    }
+}
+
+// MARK: - Center: one open tab
+
+private struct TabChip: View {
+    @Environment(\.palette) var pal
+    let tab: WorkspaceTab
+    let active: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+
+    @State private var hovering = false
+
+    private var icon: String {
+        switch tab {
+        case .data(let t):   return t.relation.kind.iconName
+        case .console:       return "chevron.left.forward.slash.chevron.right"
+        }
+    }
+    private var label: String {
+        switch tab {
+        case .data(let t):      return t.relation.name
+        case .console(let c):   return c.title.isEmpty ? "Query" : c.title
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundColor(active ? pal.accent : pal.textFaint)
+            Text(label)
+                .font(.ui(12))
+                .foregroundColor(active ? pal.textPrimary : pal.textMuted)
+                .lineLimit(1)
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(pal.textMuted)
+                    .frame(width: 15, height: 15)
+                    .background(Circle().fill(hovering ? pal.surfaceHover : .clear))
+            }
+            .buttonStyle(.plain)
+            .opacity(hovering || active ? 1 : 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: Metrics.tabbarHeight)
+        .frame(maxWidth: 190)
+        .background(active ? pal.surfaceRaised : pal.surfacePanel)
+        .overlay(alignment: .top) {
+            Rectangle().fill(active ? pal.accent : Color.clear).frame(height: 2)
+        }
+        .overlay(Divider().overlay(pal.borderSubtle), alignment: .trailing)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -493,62 +735,159 @@ private struct ColumnRow: View {
     }
 }
 
-// MARK: - Right info rail
+// MARK: - Right info rail (selection-driven inspector)
 
 private struct InfoRail: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
-    private var schemaCount: Int {
-        Set(model.selectedSnapshot?.relations.map { $0.schema } ?? []).count
-    }
-    private var viewCount: Int {
-        model.selectedSnapshot?.relations.filter { $0.kind == .view || $0.kind == .matview }.count ?? 0
-    }
-    private var tableCount: Int {
-        model.selectedSnapshot?.relations.filter { $0.kind == .table || $0.kind == .partitioned }.count ?? 0
-    }
+    let width: CGFloat
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "bolt.horizontal.circle").font(.system(size: 14)).foregroundColor(pal.textMuted)
-                Text("Connection").font(.ui(13, weight: .semibold)).foregroundColor(pal.textPrimary)
-                Spacer()
-                StatusDot(status: "connected", size: 7)
+        Group {
+            switch model.inspector {
+            case .server:              connectionInspector
+            case .database(let name):  databaseInspector(name)
+            case .relation:            tableInspector
             }
-            .padding(.horizontal, 14)
-            .frame(height: Metrics.toolbarHeight)
-            .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+        }
+        .frame(width: width)
+        .background(pal.surfacePanel)
+    }
 
+    // MARK: Connection
+
+    private var connectionInspector: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            railHeader("bolt.horizontal.circle", "Connection")
             VStack(alignment: .leading, spacing: 10) {
                 infoRow("Name", model.activeConn?.name ?? "—", mono: false)
                 infoRow("Host", model.activeConn?.hostPort ?? "—")
-                infoRow("Database", model.selectedDatabase ?? "—")
                 infoRow("User", model.activeConn?.user ?? "—")
                 infoRow("SSL", model.activeConn?.sslMode ?? "—")
             }
             .padding(14)
-
-            Text("OVERVIEW")
-                .font(.ui(10, weight: .semibold)).tracking(0.6)
-                .foregroundColor(pal.textFaint)
-                .padding(.horizontal, 14)
-                .padding(.top, 4)
-                .padding(.bottom, 8)
-
+            sectionLabel("SERVER")
             HStack(spacing: 8) {
-                stat("\(schemaCount)", "schemas")
-                stat("\(tableCount)", "tables")
-                stat("\(viewCount)", "views")
+                stat("\(model.databases.count)", "databases")
             }
             .padding(.horizontal, 14)
-
             Spacer()
         }
-        .frame(width: 250)
-        .background(pal.surfacePanel)
-        .overlay(Divider().overlay(pal.borderDefault), alignment: .leading)
+    }
+
+    // MARK: Database
+
+    private func databaseInspector(_ name: String) -> some View {
+        let snap = model.snapshots[name]
+        return VStack(alignment: .leading, spacing: 0) {
+            railHeader("cylinder.split.1x2", "Database")
+            VStack(alignment: .leading, spacing: 10) {
+                infoRow("Name", name)
+                infoRow("Server", model.activeConn?.hostPort ?? "—")
+            }
+            .padding(14)
+            sectionLabel("OVERVIEW")
+            if snap == nil && model.loadingDatabases.contains(name) {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                    Text("Loading…").font(.ui(12)).foregroundColor(pal.textMuted)
+                }
+                .padding(.horizontal, 14)
+            } else {
+                HStack(spacing: 8) {
+                    stat("\(schemaCount(snap))", "schemas")
+                    stat("\(tableCount(snap))", "tables")
+                    stat("\(viewCount(snap))", "views")
+                }
+                .padding(.horizontal, 14)
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: Table
+
+    private var tableInspector: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            railHeader("tablecells", "Table")
+            if let rel = model.selectedRelation {
+                VStack(alignment: .leading, spacing: 10) {
+                    infoRow("Schema", rel.schema)
+                    infoRow("Name", rel.name)
+                    if rel.kind == .table || rel.kind == .partitioned {
+                        infoRow("Est. rows", "~\(Fmt.rows(rel.estRows))")
+                    }
+                }
+                .padding(14)
+            }
+            HStack {
+                Text("COLUMNS")
+                    .font(.ui(10, weight: .semibold)).tracking(0.6)
+                    .foregroundColor(pal.textFaint)
+                Spacer()
+                Text("\(model.columns.count)")
+                    .font(.mono(11)).foregroundColor(pal.textFaint)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
+
+            if model.loadingColumns {
+                inlineNote { ProgressView().controlSize(.small).scaleEffect(0.7)
+                             Text("Loading columns…").font(.ui(12)).foregroundColor(pal.textMuted) }
+            } else if model.columns.isEmpty {
+                inlineNote { Text("No columns").font(.ui(12)).foregroundColor(pal.textMuted) }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(model.columns.enumerated()), id: \.element.id) { idx, col in
+                            ColumnRow(col: col, zebra: idx % 2 == 1)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 12)
+                }
+            }
+        }
+    }
+
+    // MARK: Building blocks
+
+    private func railHeader(_ icon: String, _ title: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: 14)).foregroundColor(pal.textMuted)
+            Text(title).font(.ui(13, weight: .semibold)).foregroundColor(pal.textPrimary)
+            Spacer()
+            StatusDot(status: model.connectionStatus, size: 7)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: Metrics.toolbarHeight)
+        .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+    }
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.ui(10, weight: .semibold)).tracking(0.6)
+            .foregroundColor(pal.textFaint)
+            .padding(.horizontal, 14)
+            .padding(.top, 4)
+            .padding(.bottom, 8)
+    }
+
+    @ViewBuilder private func inlineNote<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        HStack(spacing: 8) { content() }
+            .padding(.horizontal, 14)
+        Spacer()
+    }
+
+    private func schemaCount(_ snap: DBSnapshot?) -> Int {
+        Set(snap?.relations.map { $0.schema } ?? []).count
+    }
+    private func tableCount(_ snap: DBSnapshot?) -> Int {
+        snap?.relations.filter { $0.kind == .table || $0.kind == .partitioned }.count ?? 0
+    }
+    private func viewCount(_ snap: DBSnapshot?) -> Int {
+        snap?.relations.filter { $0.kind == .view || $0.kind == .matview }.count ?? 0
     }
 
     private func infoRow(_ label: String, _ value: String, mono: Bool = true) -> some View {

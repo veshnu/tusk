@@ -50,7 +50,9 @@ install: bundle
 	cp -R "$(APP)" "$(APPDIR)/"
 	@mkdir -p "$(BINDIR)"
 	install -m 0755 "$(DIST_DIR)/tusk" "$(BINDIR)/tusk"
+	@mkdir -p "$(HOME)/TuskProjects"
 	@echo "Installed $(APPDIR)/$(APP_NAME).app and $(BINDIR)/tusk"
+	@echo "Workspace folder ready at $(HOME)/TuskProjects"
 	@$(MAKE) --no-print-directory register-mcp
 
 # Register the MCP server with Claude Code at user scope (available in all
