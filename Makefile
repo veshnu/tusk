@@ -1,10 +1,14 @@
-# Tusk — build & install the GUI app and the `tusk` CLI.
+# Tusk — build, install, and release the GUI app and the `tusk` CLI.
 #
-#   make            build everything and assemble dist/Tusk.app + dist/tusk
+#   make            build everything and assemble dist/Tusk.app
 #   make install    install Tusk.app to /Applications and `tusk` onto PATH
 #   make uninstall  remove both
-#   make dist       zip a release artifact (dist/Tusk-<version>.zip)
+#   make release    signed + notarized + stapled DMG, ready to upload  <-- shipping
 #   make clean      remove build + dist output
+#
+# Release pipeline (each depends on the previous):
+#   bundle -> sign -> dmg -> notarize
+# One-time setup for signing is documented in docs/RELEASING.md.
 
 APP_NAME  := Tusk
 VERSION   := 0.1.0
@@ -13,13 +17,21 @@ CONFIG    := release
 BUILD_DIR := .build/$(CONFIG)
 DIST_DIR  := dist
 APP       := $(DIST_DIR)/$(APP_NAME).app
+DMG       := $(DIST_DIR)/$(APP_NAME)-$(VERSION).dmg
 
 # Install locations. Prefer the Homebrew bin dir if present so `tusk` lands on PATH.
 BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
 BINDIR    ?= $(if $(BREW_PREFIX),$(BREW_PREFIX)/bin,/usr/local/bin)
 APPDIR    ?= /Applications
 
-.PHONY: all build bundle install uninstall register-mcp unregister-mcp dist icon clean
+# Signing. SIGN_ID is auto-detected from the login keychain; override on the
+# command line if you have more than one Developer ID.
+SIGN_ID ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')
+NOTARY_PROFILE ?= tusk
+ENTITLEMENTS := packaging/Tusk.entitlements
+
+.PHONY: all build bundle verify-bundle install uninstall register-mcp unregister-mcp \
+        check-identity sign dmg notarize release dist icon clean
 
 all: bundle
 
@@ -34,24 +46,135 @@ icon:
 	@iconutil -c icns "$(DIST_DIR)/AppIcon.iconset" -o packaging/AppIcon.icns
 	@echo "Regenerated packaging/AppIcon.icns"
 
-# Assemble Tusk.app around the built GUI binary, and stage the CLI as `tusk`.
+# Assemble Tusk.app: the GUI binary, the CLI, and their vendored dependencies.
+#
+# Both binaries link Homebrew's libpq (which itself pulls in openssl@3 and krb5)
+# by absolute path, so bundle-dylibs.sh vendors that whole dependency tree into a
+# Frameworks/ dir and rewrites the load paths. Without it the app only runs on a
+# machine that happens to have the same Homebrew kegs.
+#
+# The CLI lives INSIDE the bundle rather than beside it, so that a single Tusk.app
+# is the whole product: one thing to sign, one thing to notarize, one thing to drag
+# out of a DMG. `install` and the Homebrew cask symlink it onto PATH as `tusk` (the
+# way VS Code ships `code`). It shares the app's vendored dylibs via
+# @executable_path/../Frameworks.
+#
+# It is named `tuskcli` in here, NOT `tusk`: macOS filesystems are case-insensitive,
+# so Contents/MacOS/tusk and Contents/MacOS/Tusk are the same file and the CLI would
+# silently overwrite the GUI binary. The symlink is what carries the `tusk` name.
 bundle: build
 	@rm -rf "$(APP)"
-	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
+	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources" "$(APP)/Contents/Frameworks"
 	@cp "$(BUILD_DIR)/$(APP_NAME)" "$(APP)/Contents/MacOS/$(APP_NAME)"
+	@cp "$(BUILD_DIR)/tuskcli" "$(APP)/Contents/MacOS/tuskcli"
+	@chmod +x "$(APP)/Contents/MacOS/tuskcli"
 	@sed 's/__VERSION__/$(VERSION)/g' packaging/Info.plist.in > "$(APP)/Contents/Info.plist"
 	@cp packaging/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
-	@cp "$(BUILD_DIR)/tuskcli" "$(DIST_DIR)/tusk"
-	@chmod +x "$(DIST_DIR)/tusk"
-	@echo "Built $(APP) and $(DIST_DIR)/tusk"
+	@install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP)/Contents/MacOS/$(APP_NAME)" 2>/dev/null || true
+	@install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP)/Contents/MacOS/tuskcli" 2>/dev/null || true
+	@bash packaging/bundle-dylibs.sh "$(APP)/Contents/Frameworks" \
+		"$(APP)/Contents/MacOS/$(APP_NAME)" "$(APP)/Contents/MacOS/tuskcli"
+	@codesign --force --sign - "$(APP)/Contents/MacOS/tuskcli" 2>/dev/null
+	@codesign --force --sign - "$(APP)" 2>/dev/null
+	@# Guard the case-collision bug above: both binaries must survive, at full size.
+	@test -f "$(APP)/Contents/MacOS/tuskcli" || { echo "FAIL: CLI missing from bundle"; exit 1; }
+	@if [ "$$(stat -f%z "$(APP)/Contents/MacOS/$(APP_NAME)")" -lt 1000000 ]; then \
+		echo "FAIL: $(APP_NAME) binary is too small — the CLI clobbered the GUI."; exit 1; \
+	fi
+	@echo "Built $(APP) (GUI + embedded tuskcli)"
 
+# Fail loudly if anything in the bundle still points at Homebrew — the exact bug
+# that ships an app which launches here and crashes everywhere else.
+verify-bundle:
+	@echo "Checking for absolute non-system dylib paths..."
+	@! otool -L "$(APP)/Contents/MacOS/$(APP_NAME)" "$(APP)/Contents/MacOS/tuskcli" $(APP)/Contents/Frameworks/*.dylib 2>/dev/null \
+		| grep -E '^\s+/(opt|usr/local)/' \
+		|| { echo "FAIL: bundle still references Homebrew paths above."; exit 1; }
+	@echo "OK: no Homebrew paths. Bundle is self-contained."
+
+# --- Release: sign -> dmg -> notarize -------------------------------------------
+
+check-identity:
+	@if [ -z "$(SIGN_ID)" ]; then \
+		echo "ERROR: no 'Developer ID Application' certificate in your keychain."; \
+		echo "       Xcode > Settings > Accounts > Manage Certificates > + > Developer ID Application"; \
+		echo "       See docs/RELEASING.md."; \
+		exit 1; \
+	fi
+	@echo "Signing identity: $(SIGN_ID)"
+
+# Sign inside-out: nested code first, bundle last. codesign seals what it finds,
+# so signing the outer bundle before the dylibs would seal unsigned libraries and
+# fail notarization. (Apple explicitly advises against --deep for distribution.)
+#
+# This must run AFTER bundle-dylibs.sh: install_name_tool invalidates signatures,
+# so any signing done before path rewriting is destroyed by it.
+sign: bundle verify-bundle check-identity
+	@echo "Signing vendored dylibs..."
+	@for lib in $(APP)/Contents/Frameworks/*.dylib; do \
+		codesign --force --options runtime --timestamp --sign "$(SIGN_ID)" "$$lib" || exit 1; \
+	done
+	@echo "Signing embedded CLI..."
+	@codesign --force --options runtime --timestamp --sign "$(SIGN_ID)" "$(APP)/Contents/MacOS/tuskcli"
+	@echo "Signing app bundle..."
+	@codesign --force --options runtime --timestamp --entitlements "$(ENTITLEMENTS)" --sign "$(SIGN_ID)" "$(APP)"
+	@codesign --verify --strict --verbose=2 "$(APP)"
+	@echo "Signed $(APP)"
+
+# Notarization happens TWICE, and the order matters.
+#
+# A stapled ticket is what lets Gatekeeper approve the app with no network. The
+# ticket is attached to a specific artifact, so stapling the DMG does nothing for
+# the app a user drags OUT of it. If we only stapled the DMG, the installed app
+# would carry no ticket and a first launch offline would fail to verify.
+#
+# So: notarize the app, staple the app, and only THEN build the DMG around the
+# already-stapled app — and notarize/staple the DMG too, so the disk image itself
+# also opens cleanly. Both artifacts end up self-sufficient offline.
+notarize-app: sign
+	@echo "Submitting app to Apple (1-5 minutes)..."
+	@rm -f "$(DIST_DIR)/notarize-app.zip"
+	@ditto -c -k --keepParent "$(APP)" "$(DIST_DIR)/notarize-app.zip"
+	xcrun notarytool submit "$(DIST_DIR)/notarize-app.zip" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple "$(APP)"
+	@rm -f "$(DIST_DIR)/notarize-app.zip"
+
+dmg: notarize-app
+	@rm -f "$(DMG)"
+	@rm -rf "$(DIST_DIR)/dmgroot"
+	@mkdir -p "$(DIST_DIR)/dmgroot"
+	@cp -R "$(APP)" "$(DIST_DIR)/dmgroot/"
+	@ln -s /Applications "$(DIST_DIR)/dmgroot/Applications"
+	@hdiutil create -volname "$(APP_NAME)" -srcfolder "$(DIST_DIR)/dmgroot" \
+		-ov -format UDZO "$(DMG)" >/dev/null
+	@rm -rf "$(DIST_DIR)/dmgroot"
+	@codesign --force --timestamp --sign "$(SIGN_ID)" "$(DMG)"
+	@echo "Wrote $(DMG)"
+
+notarize: dmg
+	@echo "Submitting DMG to Apple (1-5 minutes)..."
+	xcrun notarytool submit "$(DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple "$(DMG)"
+	@echo
+	@echo "Verifying Gatekeeper acceptance..."
+	@spctl -a -t open --context context:primary-signature -v "$(DMG)"
+	@spctl -a -vv "$(APP)"
+	@xcrun stapler validate "$(APP)" | tail -1
+	@echo
+	@echo "Release ready: $(DMG)"
+	@shasum -a 256 "$(DMG)"
+
+release: notarize
+
+# `tusk` on PATH is a symlink into the installed bundle, not a copy: one binary,
+# one set of dylibs, and it can never drift out of sync with the app.
 install: bundle
 	@rm -rf "$(APPDIR)/$(APP_NAME).app"
 	cp -R "$(APP)" "$(APPDIR)/"
 	@mkdir -p "$(BINDIR)"
-	install -m 0755 "$(DIST_DIR)/tusk" "$(BINDIR)/tusk"
+	ln -sf "$(APPDIR)/$(APP_NAME).app/Contents/MacOS/tuskcli" "$(BINDIR)/tusk"
 	@mkdir -p "$(HOME)/TuskProjects"
-	@echo "Installed $(APPDIR)/$(APP_NAME).app and $(BINDIR)/tusk"
+	@echo "Installed $(APPDIR)/$(APP_NAME).app and linked $(BINDIR)/tusk"
 	@echo "Workspace folder ready at $(HOME)/TuskProjects"
 	@$(MAKE) --no-print-directory register-mcp
 
@@ -75,10 +198,9 @@ uninstall: unregister-mcp
 	rm -f "$(BINDIR)/tusk"
 	@echo "Removed $(APPDIR)/$(APP_NAME).app, $(BINDIR)/tusk, and the Claude MCP entry"
 
-# Release artifact: a zip containing both Tusk.app and the tusk binary, for the cask.
-dist: bundle
-	cd "$(DIST_DIR)" && ditto -c -k --sequesterRsrc --keepParent . "$(APP_NAME)-$(VERSION).zip"
-	@echo "Wrote $(DIST_DIR)/$(APP_NAME)-$(VERSION).zip"
+# The DMG is now the one and only release artifact — the website download AND the
+# Homebrew cask both point at it, so there's no second artifact to drift.
+dist: release
 
 clean:
 	rm -rf "$(DIST_DIR)"

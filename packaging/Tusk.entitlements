@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+Deliberately empty. Tusk ships outside the App Store, so it is not sandboxed:
+network access, file access, and spawning the Claude Code PTY all work with no
+entitlement. The hardened runtime is applied by codesign at signing time and is
+not an entitlement.
+
+Notably absent: com.apple.security.cs.disable-library-validation. It is not
+needed (the vendored dylibs carry the same Developer ID as the app, so library
+validation passes) and adding it would let any library be injected into Tusk.
+
+Add an entitlement only when a concrete failure proves it necessary. See
+docs/RELEASING.md. Note: XML comments may not contain a double hyphen, which is
+easy to trip over when writing codesign flags in here. The entitlements parser
+rejects the whole file if you do.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>
