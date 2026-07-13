@@ -110,15 +110,7 @@ check-identity:
 # This must run AFTER bundle-dylibs.sh: install_name_tool invalidates signatures,
 # so any signing done before path rewriting is destroyed by it.
 sign: bundle verify-bundle check-identity
-	@echo "Signing vendored dylibs..."
-	@for lib in $(APP)/Contents/Frameworks/*.dylib; do \
-		codesign --force --options runtime --timestamp --sign "$(SIGN_ID)" "$$lib" || exit 1; \
-	done
-	@echo "Signing embedded CLI..."
-	@codesign --force --options runtime --timestamp --sign "$(SIGN_ID)" "$(APP)/Contents/MacOS/tuskcli"
-	@echo "Signing app bundle..."
-	@codesign --force --options runtime --timestamp --entitlements "$(ENTITLEMENTS)" --sign "$(SIGN_ID)" "$(APP)"
-	@codesign --verify --strict --verbose=2 "$(APP)"
+	@bash packaging/sign-app.sh "$(APP)" "$(SIGN_ID)" "$(ENTITLEMENTS)"
 	@echo "Signed $(APP)"
 
 # Notarization happens TWICE, and the order matters.
@@ -168,7 +160,22 @@ release: notarize
 
 # `tusk` on PATH is a symlink into the installed bundle, not a copy: one binary,
 # one set of dylibs, and it can never drift out of sync with the app.
+#
+# Sign with the real Developer ID if one is available, rather than leaving the
+# ad-hoc signature from `bundle`. Tusk keeps database passwords in the login
+# keychain, and keychain ACLs are bound to the app's code-signing identity. An
+# ad-hoc signature has no stable identity — its hash changes on every build — so
+# each rebuild looks like a DIFFERENT app to the keychain and macOS challenges you
+# for your login password all over again. Signing with the Developer ID gives the
+# app one stable identity across rebuilds, and the prompt stops.
 install: bundle
+	@if [ -n "$(SIGN_ID)" ]; then \
+		echo "Signing with: $(SIGN_ID)"; \
+		bash packaging/sign-app.sh "$(APP)" "$(SIGN_ID)" "$(ENTITLEMENTS)"; \
+	else \
+		echo "note: no Developer ID certificate found — installing ad-hoc signed."; \
+		echo "      macOS will re-prompt for keychain access after every rebuild."; \
+	fi
 	@rm -rf "$(APPDIR)/$(APP_NAME).app"
 	cp -R "$(APP)" "$(APPDIR)/"
 	@mkdir -p "$(BINDIR)"
