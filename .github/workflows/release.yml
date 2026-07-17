@@ -1,0 +1,122 @@
+name: Release
+
+# Cutting a release is `git tag v0.2.0 && git push --tags`. Everything below is
+# what `make release` does locally, with the signing identity injected from
+# secrets instead of read from a developer's login keychain.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:          # lets you dry-run the pipeline without tagging
+
+# Needed to create the GitHub Release and upload the DMG to it. The default
+# GITHUB_TOKEN is read-only, and publishing fails with a 403 without this.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # MUST be an Apple Silicon runner: Tusk is arm64-only, and it vendors arm64
+    # dylibs from Homebrew. macos-13 is Intel and would produce a broken build.
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Package.swift links Homebrew's libpq; bundle-dylibs.sh then vendors it (and
+      # openssl@3 + krb5) into the .app, so this dependency does not reach users.
+      - name: Install libpq
+        run: brew install libpq
+
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          CERT_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT=$RUNNER_TEMP/devid.p12
+          KEYCHAIN=$RUNNER_TEMP/build.keychain-db
+          echo "$CERT_P12_BASE64" | base64 --decode > "$CERT"
+
+          # A dedicated, ephemeral keychain. It dies with the runner.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"     # don't auto-lock mid-build
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security import "$CERT" -k "$KEYCHAIN" -P "$CERT_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+
+          # Without this, codesign blocks on a GUI prompt for the private key that
+          # nobody can answer, and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          # Apple's Developer ID G2 intermediate. Without it the certificate cannot
+          # chain to a trusted root and `find-identity` reports 0 valid identities —
+          # the certificate looks fine, and nothing will sign.
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN"
+
+          # Put it on the search list so the Makefile's find-identity sees it.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$CERT"
+
+          security find-identity -v -p codesigning
+
+      - name: Store notarization credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials "tusk" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+
+      # build -> vendor dylibs -> sign -> notarize app -> staple -> dmg -> notarize
+      # dmg -> staple. Identical to a local `make release`.
+      - name: Build, sign, and notarize
+        run: make release
+
+      - name: Checksum
+        id: checksum
+        run: |
+          DMG=$(ls dist/*.dmg)
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "$DMG" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # Prove the artifact is actually good before publishing it, rather than
+      # discovering it is not from a user's bug report.
+      - name: Verify the artifact Gatekeeper will see
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.checksum.outputs.dmg }}"
+          spctl -a -t open --context context:primary-signature -v "$DMG"
+          xcrun stapler validate "$DMG"
+          xcrun stapler validate dist/Tusk.app        # the app users drag OUT of the DMG
+          make verify-bundle                          # no Homebrew paths survived
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.checksum.outputs.dmg }}
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the DMG below and drag Tusk to Applications. Signed and
+            notarized by Apple, so it opens without a Gatekeeper warning.
+
+            Or via Homebrew:
+
+            ```
+            brew tap veshnu/tusk
+            brew install --cask tusk
+            ```
+
+            Requires an Apple Silicon Mac running macOS 13 or later.
+
+            `sha256: ${{ steps.checksum.outputs.sha256 }}`

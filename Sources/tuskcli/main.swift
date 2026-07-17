@@ -1,4 +1,5 @@
 import Foundation
+import MachO
 import TuskCore
 
 // Tiny companion CLI for the Tusk app. This binary is installed on PATH as `tusk`
@@ -52,15 +53,22 @@ func printUsage() {
     """)
 }
 
+/// The libpq this process actually loaded, straight from dyld.
+///
+/// Probing well-known paths on disk would be a lie: releases vendor libpq into
+/// Tusk.app/Contents/Frameworks and load it via @rpath, so a Homebrew libpq may
+/// exist on the machine without being the one in use — or, on a user's Mac, not
+/// exist at all while Tusk works fine.
+func loadedLibpqPath() -> String? {
+    (0..<_dyld_image_count()).lazy
+        .compactMap { _dyld_get_image_name($0) }
+        .map { String(cString: $0) }
+        .first { $0.contains("libpq") }
+}
+
 func runDoctor() {
     print("tusk doctor")
-    let libpqCandidates = [
-        "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
-        "/usr/local/opt/libpq/lib/libpq.5.dylib",
-        "/usr/lib/libpq.5.dylib",
-    ]
-    let libpq = libpqCandidates.first { FileManager.default.fileExists(atPath: $0) }
-    print("  libpq:    \(libpq ?? "NOT FOUND — run `brew install libpq`")")
+    print("  libpq:    \(loadedLibpqPath() ?? "NOT LOADED — this build is broken")")
 
     let app = "/Applications/Tusk.app"
     let appInstalled = FileManager.default.fileExists(atPath: app)
