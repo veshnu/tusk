@@ -72,7 +72,7 @@ public actor MCPSession {
     }
 
     public static let serverName = "tusk"
-    public static let serverVersion = "0.1.0"
+    public static let serverVersion = TuskVersion.current
 
     public func handle(_ line: String) async -> String? {
         guard let data = line.data(using: .utf8),

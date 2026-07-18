@@ -6,7 +6,7 @@ import TuskCore
 // (the build product is named `tuskcli` only to avoid a case-insensitive clash
 // with the `Tusk` app binary). Claude Code and other MCP clients spawn `tusk mcp`.
 
-let toolVersion = "0.1.0"
+let toolVersion = TuskVersion.current
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 let command = arguments.first

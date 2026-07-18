@@ -8,7 +8,7 @@
 #   brew tap veshnu/tusk
 #   brew install --cask tusk
 cask "tusk" do
-  version "0.1.0"
+  version "0.1.1"
   sha256 :no_check # TODO: shasum -a 256 dist/Tusk-<version>.dmg
 
   url "https://github.com/veshnu/tusk/releases/download/v#{version}/Tusk-#{version}.dmg"
