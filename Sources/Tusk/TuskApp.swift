@@ -15,7 +15,11 @@ struct TuskApp: App {
                 .environment(\.palette, model.palette)
                 .preferredColorScheme(model.isDark ? .dark : .light)
                 .frame(minWidth: 940, minHeight: 620)
-                .onAppear { model.connectionStore = store }
+                .onAppear {
+                    model.connectionStore = store
+                    model.startServices()
+                    model.restoreSession(store: store)
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1320, height: 820)
@@ -45,13 +49,7 @@ struct RootView: View {
     var body: some View {
         ZStack {
             pal.surfaceApp.ignoresSafeArea()
-            switch model.route {
-            case .connect:
-                ConnectScreen()
-            case .workspace:
-                Workspace()
-            }
+            Workspace()
         }
-        .animation(.easeInOut(duration: 0.2), value: model.route)
     }
 }

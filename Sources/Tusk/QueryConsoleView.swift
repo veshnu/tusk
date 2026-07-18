@@ -29,7 +29,7 @@ struct ConsolePane: View {
             Divider().overlay(pal.borderSubtle)
 
             SQLEditorView(text: sqlBinding, isDark: model.isDark,
-                          schema: model.schemaIndex(for: c.database),
+                          schema: model.schemaIndex(connId: c.connectionId, database: c.database),
                           onRun: { model.runConsole(console.id) })
                 .frame(height: CGFloat(editorHeight))
                 .background(pal.surfaceInset)
@@ -85,8 +85,8 @@ struct ConsolePane: View {
     private func statusBar(_ c: QueryConsole) -> some View {
         let state = c.running ? "running" : (c.error != nil ? "error" : "idle")
         return HStack(spacing: 10) {
-            StatusDot(status: model.connectionStatus, size: 7)
-            Text(model.activeConn?.hostPort ?? "—").font(.mono(11)).foregroundColor(pal.textSecondary)
+            StatusDot(status: model.status(for: c.connectionId), size: 7)
+            Text(model.connection(for: c.connectionId)?.hostPort ?? "—").font(.mono(11)).foregroundColor(pal.textSecondary)
             Text("·").foregroundColor(pal.textFaint)
             Text(c.database).font(.mono(11)).foregroundColor(pal.syntax.table)
             Spacer()

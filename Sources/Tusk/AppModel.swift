@@ -1,9 +1,10 @@
 import SwiftUI
 import TuskCore
 
-/// One open table in the center pane. `id` is "database|schema.name".
+/// One open table in the center pane. `id` is "connectionId|database|schema.name".
 struct DataTab: Identifiable, Equatable {
     let id: String
+    let connectionId: String
     let database: String
     let relation: Relation
     var columns: [String] = []
@@ -15,31 +16,39 @@ struct DataTab: Identifiable, Equatable {
     /// Column metadata keyed by name (type badge + PK/FK glyphs in the grid header).
     func info(for column: String) -> ColumnInfo? { columnInfos.first { $0.name == column } }
 
-    static func makeID(database: String, relationID: String) -> String { "\(database)|\(relationID)" }
+    static func makeID(connectionId: String, database: String, relationID: String) -> String {
+        "\(connectionId)|\(database)|\(relationID)"
+    }
+}
+
+/// Everything scoped to one open (or opening) connection: its own libpq manager,
+/// browsed database(s), loaded schema snapshots, and tree-expansion state. Tusk
+/// holds one of these per *connected* connection, keyed by connection id in
+/// `AppModel.sessions` — several may be live at once.
+struct ConnState {
+    var connection: Connection
+    let db: Database
+    var status: String = "connecting"          // connecting / connected / error
+    var expanded: Bool = true                   // connection node open in the tree
+    var databases: [String] = []
+    var snapshots: [String: DBSnapshot] = [:]
+    var expandedDatabases: Set<String> = []
+    var loadingDatabases: Set<String> = []
+    var databaseErrors: [String: String] = [:]
+    var columnCache: [String: [ColumnInfo]] = [:]   // keyed "database|schema.table"
+    var prefetchedColumnDBs: Set<String> = []
 }
 
 @MainActor
 final class AppModel: ObservableObject {
-    enum Route { case connect, workspace }
-
-    @Published var route: Route = .connect
     @Published var isDark: Bool = false
 
-    // Active session
-    @Published var activeConn: Connection?
-
-    // Server → databases → schemas → relations.
-    // Databases are enumerated on connect; each database's relations are loaded
-    // lazily the first time its node is expanded.
-    @Published var databases: [String] = []
-    @Published var snapshots: [String: DBSnapshot] = [:]
-    @Published var expandedDatabases: Set<String> = []
-    @Published var loadingDatabases: Set<String> = []
-    @Published var databaseErrors: [String: String] = [:]
-
-    // Live connection health, polled while connected ("connected" / "error" / "connecting").
-    @Published var connectionStatus: String = "connecting"
-    private var healthTask: Task<Void, Never>?
+    // Live connections, keyed by connection id. A connection appears here only while
+    // it is connecting/connected/errored; disconnected connections live in the
+    // `ConnectionStore` alone and render in the tree straight from there.
+    @Published var sessions: [String: ConnState] = [:]
+    @Published var connectErrors: [String: String] = [:]     // last connect failure, per connection id
+    private var healthTasks: [String: Task<Void, Never>] = [:]
 
     // Embedded Claude Code terminal (bottom-docked panel).
     @Published var showTerminal = false
@@ -47,123 +56,75 @@ final class AppModel: ObservableObject {
 
     func toggleTerminal() { showTerminal.toggle() }
 
-    // Transient UI state
-    @Published var connecting = false
-    @Published var connectError: String?
-    @Published var loadingSchema = false
-    @Published var schemaError: String?
-
     /// What the right-hand inspector rail is describing. Driven by single-clicks in the tree.
     enum Inspector: Equatable {
-        case server
-        case database(String)
+        case none
+        case connection(String)                 // connection id
+        case database(connId: String, name: String)
         case relation
     }
-    @Published var inspector: Inspector = .server
+    @Published var inspector: Inspector = .none
 
-    // Selected relation in the workspace + its columns (shown in the inspector).
+    // Current selection across all connections (drives the inspector + query seeds).
+    @Published var selectedConnectionId: String?
     @Published var selectedDatabase: String?
     @Published var selectedRelationID: String?      // "schema.name" within selectedDatabase
-    @Published var columns: [ColumnInfo] = []
+    @Published var columns: [ColumnInfo] = []       // selected relation's columns (inspector)
     @Published var loadingColumns = false
 
     // Open tabs shown in the center pane: table data (double-click) or query consoles.
+    // A single global list mixing tabs from every connection — each tab carries its
+    // own connection id.
     @Published var tabs: [WorkspaceTab] = []
     @Published var activeTabID: String?
 
-    // Column cache for SQL completion, keyed "database|schema.table".
-    private var columnCache: [String: [ColumnInfo]] = [:]
-    private var prefetchedColumnDBs: Set<String> = []
     private var persistTask: Task<Void, Never>?
 
-    let db = Database()
-
-    /// Set once at launch; lets the MCP provider enumerate all configured connections.
+    /// Set once at launch; lets the tree/modal enumerate all configured connections
+    /// and the MCP provider reach any of them.
     weak var connectionStore: ConnectionStore?
 
-    /// MCP server hosting the live connection over the app's unix socket.
+    /// MCP server hosting Tusk's live connections over the app's unix socket.
     private var mcpServer: MCPSocketServer?
+    private var servicesStarted = false
+
+    private let connectedIdsKey = "tusk.connectedIds.v1"
 
     var palette: Palette { Palette(isDark: isDark) }
 
     func toggleTheme() { isDark.toggle() }
 
-    /// The server root label in the explorer, e.g. "postgres@localhost".
-    var serverLabel: String {
-        guard let c = activeConn else { return "server" }
-        return "\(c.user)@\(c.host)"
+    // MARK: Session lookups
+
+    func session(_ id: String) -> ConnState? { sessions[id] }
+    func db(for id: String) -> Database? { sessions[id]?.db }
+    func status(for id: String) -> String { sessions[id]?.status ?? "disconnected" }
+    func isConnected(_ id: String) -> Bool { sessions[id]?.status == "connected" }
+    var connectedCount: Int { sessions.values.filter { $0.status == "connected" }.count }
+
+    /// The connection's config, whether it is live (session) or just saved (store).
+    func connection(for id: String) -> Connection? {
+        sessions[id]?.connection ?? connectionStore?.connections.first { $0.id == id }
     }
 
-    /// Open a connection, load the connected database's schema, and route into the
-    /// workspace on success. Only the connected database is browsed — Tusk holds a
-    /// single connection rather than one per database on the server.
-    func connect(_ conn: Connection) {
-        guard !connecting else { return }
-        connecting = true
-        connectError = nil
-        Task {
-            do {
-                try await db.open(conn)
-                let snap = try await db.snapshot(database: conn.database)
-                activeConn = conn
-                databases = [conn.database]
-                snapshots = [conn.database: snap]
-                expandedDatabases = [conn.database]
-                databaseErrors = [:]
-                selectedDatabase = conn.database
-                route = .workspace
-                connectionStatus = "connected"
-                selectServer()
-                restoreConsoles(for: conn.id)
-                prefetchColumns(database: conn.database)
-                startMCPServer(for: conn)
-                startHealthMonitor()
-            } catch {
-                connectError = error.localizedDescription
-            }
-            connecting = false
-        }
+    /// Mutate one session in place (triggers SwiftUI updates via the `sessions` dict).
+    private func mutate(_ id: String, _ f: (inout ConnState) -> Void) {
+        guard var s = sessions[id] else { return }
+        f(&s)
+        sessions[id] = s
     }
 
-    /// Toggle a database node; load its schema on first expand.
-    func toggleDatabase(_ database: String) {
-        if expandedDatabases.contains(database) {
-            expandedDatabases.remove(database)
-        } else {
-            expandedDatabases.insert(database)
-            loadDatabase(database)
-        }
+    // MARK: App services
+
+    /// Start the always-on services once (the MCP socket server). Safe to call repeatedly.
+    func startServices() {
+        guard !servicesStarted else { return }
+        servicesStarted = true
+        startMCPServer()
     }
 
-    private func loadDatabase(_ database: String) {
-        guard snapshots[database] == nil, !loadingDatabases.contains(database) else { return }
-        loadingDatabases.insert(database)
-        databaseErrors[database] = nil
-        Task {
-            do { snapshots[database] = try await db.snapshot(database: database) }
-            catch { databaseErrors[database] = error.localizedDescription }
-            loadingDatabases.remove(database)
-        }
-    }
-
-    func refreshSchema() {
-        guard activeConn != nil else { return }
-        let loaded = Array(snapshots.keys)
-        loadingSchema = true
-        schemaError = nil
-        Task {
-            do {
-                for d in loaded { snapshots[d] = try await db.snapshot(database: d) }
-            } catch { schemaError = error.localizedDescription }
-            loadingSchema = false
-        }
-    }
-
-    // MARK: MCP server lifecycle
-
-    private func startMCPServer(for conn: Connection) {
-        guard let store = connectionStore else { return }
-        mcpServer?.stop()
+    private func startMCPServer() {
+        guard let store = connectionStore, mcpServer == nil else { return }
         let provider = AppTuskProvider(model: self, store: store)
         let server = MCPSocketServer(provider: provider)
         do {
@@ -175,84 +136,191 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func stopMCPServer() {
-        mcpServer?.stop()
-        mcpServer = nil
+    /// Reconnect the connections that were open when the app last quit (only those
+    /// with a saved keychain password can reconnect silently).
+    func restoreSession(store: ConnectionStore) {
+        let ids = (UserDefaults.standard.array(forKey: connectedIdsKey) as? [String]) ?? []
+        for id in ids {
+            guard let conn = store.connections.first(where: { $0.id == id }), conn.savePassword else { continue }
+            connect(store.withPassword(conn))
+        }
     }
 
-    // MARK: Connection health
+    private func persistConnectedIds() {
+        let ids = sessions.filter { $0.value.status == "connected" }.map { $0.key }
+        UserDefaults.standard.set(ids, forKey: connectedIdsKey)
+    }
 
-    /// Poll the live connection every few seconds and reflect it in `connectionStatus`.
-    private func startHealthMonitor() {
-        healthTask?.cancel()
-        healthTask = Task { [weak self] in
+    /// Probe a config with an ephemeral connection (the Manage modal's "Test").
+    func testConnection(_ cfg: Connection) async throws -> TestResult {
+        try await Database().test(cfg)
+    }
+
+    // MARK: Connect / disconnect
+
+    /// Open `conn` as a new live session (keeping any other live connections). If it
+    /// is already connecting/connected, just focus it.
+    func connect(_ conn: Connection) {
+        if let s = sessions[conn.id], s.status == "connected" || s.status == "connecting" {
+            selectConnection(conn.id)
+            return
+        }
+        let database = Database()
+        sessions[conn.id] = ConnState(connection: conn, db: database, status: "connecting", expanded: true)
+        connectErrors[conn.id] = nil
+        Task {
+            do {
+                try await database.open(conn)
+                let snap = try await database.snapshot(database: conn.database)
+                mutate(conn.id) {
+                    $0.status = "connected"
+                    $0.databases = [conn.database]
+                    $0.snapshots = [conn.database: snap]
+                    $0.expandedDatabases = [conn.database]
+                    $0.databaseErrors = [:]
+                }
+                selectedConnectionId = conn.id
+                selectedDatabase = conn.database
+                inspector = .connection(conn.id)
+                restoreConsoles(for: conn.id)
+                prefetchColumns(connId: conn.id, database: conn.database)
+                startHealthMonitor(conn.id)
+                persistConnectedIds()
+            } catch {
+                await database.close()
+                sessions[conn.id] = nil
+                connectErrors[conn.id] = error.localizedDescription
+                persistConnectedIds()
+            }
+        }
+    }
+
+    /// Tear down one connection: persist + drop its consoles, close its lanes, remove
+    /// its tabs, and forget the session. Other connections are untouched.
+    func disconnect(_ connId: String) {
+        guard let s = sessions[connId] else { return }
+        healthTasks[connId]?.cancel()
+        healthTasks[connId] = nil
+        // Persist all consoles (incl. this connection's) so they restore on reconnect.
+        flushConsolePersist()
+        let db = s.db
+        let removed = tabs.filter { $0.connectionId == connId }
+        for t in removed {
+            if t.asConsole != nil { Task { await db.closeConsole(t.id) } }
+            else { Task { await db.closeTab(t.id) } }
+        }
+        tabs.removeAll { $0.connectionId == connId }
+        Task { await db.close() }
+        sessions[connId] = nil
+        connectErrors[connId] = nil
+        persistConnectedIds()
+
+        if selectedConnectionId == connId {
+            selectedConnectionId = nil
+            selectedDatabase = nil
+            selectedRelationID = nil
+            columns = []
+            inspector = .none
+        }
+        if let active = activeTabID, !tabs.contains(where: { $0.id == active }) {
+            if let next = tabs.first { focusTab(next.id) } else { activeTabID = nil }
+        }
+    }
+
+    /// Poll one connection's browse lane and reflect liveness in its session status.
+    private func startHealthMonitor(_ id: String) {
+        healthTasks[id]?.cancel()
+        healthTasks[id] = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                let ok = await self.db.ping()
+                guard let self, let db = self.sessions[id]?.db else { return }
+                let ok = await db.ping()
                 if Task.isCancelled { return }
-                self.connectionStatus = ok ? "connected" : "error"
+                self.mutate(id) { $0.status = ok ? "connected" : "error" }
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
         }
     }
 
-    private func stopHealthMonitor() {
-        healthTask?.cancel()
-        healthTask = nil
+    /// Refresh the loaded schema snapshots of every connected session.
+    func refreshSchema() {
+        for (id, s) in sessions where s.status == "connected" {
+            let db = s.db
+            let loaded = Array(s.snapshots.keys)
+            Task {
+                for d in loaded {
+                    if let snap = try? await db.snapshot(database: d) {
+                        mutate(id) { $0.snapshots[d] = snap }
+                    }
+                }
+            }
+        }
     }
 
-    func disconnect() {
-        stopMCPServer()
-        stopHealthMonitor()
-        persistTask?.cancel()
-        flushConsolePersist()   // keep the console index/files for next time
-        Task { await db.close() }
-        activeConn = nil
-        databases = []
-        snapshots = [:]
-        expandedDatabases = []
-        loadingDatabases = []
-        databaseErrors = [:]
-        columns = []
-        columnCache = [:]
-        prefetchedColumnDBs = []
-        selectedDatabase = nil
-        selectedRelationID = nil
-        inspector = .server
-        tabs = []
-        activeTabID = nil
-        connectionStatus = "connecting"
-        route = .connect
+    // MARK: Tree expansion
+
+    /// Toggle a connection's top-level node (connected connections only).
+    func toggleConnection(_ connId: String) {
+        mutate(connId) { $0.expanded.toggle() }
+    }
+
+    /// Toggle a database node; load its schema on first expand.
+    func toggleDatabase(_ connId: String, _ database: String) {
+        guard let s = sessions[connId] else { return }
+        if s.expandedDatabases.contains(database) {
+            mutate(connId) { $0.expandedDatabases.remove(database) }
+        } else {
+            mutate(connId) { $0.expandedDatabases.insert(database) }
+            loadDatabase(connId, database)
+        }
+    }
+
+    private func loadDatabase(_ connId: String, _ database: String) {
+        guard let s = sessions[connId], s.snapshots[database] == nil, !s.loadingDatabases.contains(database) else { return }
+        let db = s.db
+        mutate(connId) { $0.loadingDatabases.insert(database); $0.databaseErrors[database] = nil }
+        Task {
+            do {
+                let snap = try await db.snapshot(database: database)
+                mutate(connId) { $0.snapshots[database] = snap }
+            } catch {
+                mutate(connId) { $0.databaseErrors[database] = error.localizedDescription }
+            }
+            mutate(connId) { $0.loadingDatabases.remove(database) }
+        }
     }
 
     // MARK: Inspector selection (single-click)
 
-    /// Single-click the server node: describe the connection in the inspector.
-    func selectServer() {
-        inspector = .server
+    /// Single-click a connection node: describe the connection in the inspector.
+    func selectConnection(_ connId: String) {
+        inspector = .connection(connId)
+        selectedConnectionId = connId
         selectedRelationID = nil
     }
 
     /// Single-click a database node: describe the database (loading its snapshot for stats).
-    func selectDatabase(_ database: String) {
-        inspector = .database(database)
+    func selectDatabase(_ connId: String, _ database: String) {
+        inspector = .database(connId: connId, name: database)
+        selectedConnectionId = connId
         selectedDatabase = database
         selectedRelationID = nil
-        loadDatabase(database)
+        loadDatabase(connId, database)
     }
 
     /// Single-click a relation: describe it (its columns) in the inspector.
-    func select(database: String, relation: Relation) {
+    func select(_ connId: String, database: String, relation: Relation) {
         inspector = .relation
+        selectedConnectionId = connId
         selectedDatabase = database
         selectedRelationID = relation.id
         loadingColumns = true
         columns = []
+        guard let db = sessions[connId]?.db else { loadingColumns = false; return }
         let token = selectionToken
         Task {
             do {
                 let cols = try await db.columns(database: database, schema: relation.schema, table: relation.name)
-                columnCache["\(database)|\(relation.schema).\(relation.name)"] = cols
+                mutate(connId) { $0.columnCache["\(database)|\(relation.schema).\(relation.name)"] = cols }
                 if selectionToken == token { columns = cols }
             } catch {
                 if selectionToken == token { columns = [] }
@@ -264,22 +332,28 @@ final class AppModel: ObservableObject {
     // MARK: Table tabs (double-click)
 
     /// Double-click a relation: select it, and open (or focus) a data tab for it.
-    func openTable(database: String, relation: Relation) {
-        select(database: database, relation: relation)
-        let id = DataTab.makeID(database: database, relationID: relation.id)
+    func openTable(_ connId: String, database: String, relation: Relation) {
+        select(connId, database: database, relation: relation)
+        let id = DataTab.makeID(connectionId: connId, database: database, relationID: relation.id)
         activeTabID = id
         if tabs.contains(where: { $0.id == id }) { return }   // already open — just focus it
-        tabs.append(.data(DataTab(id: id, database: database, relation: relation)))
-        loadRows(for: id, database: database, relation: relation)
+        tabs.append(.data(DataTab(id: id, connectionId: connId, database: database, relation: relation)))
+        loadRows(for: id, connId: connId, database: database, relation: relation)
     }
 
     /// Switch to an already-open tab and sync the inspector to its subject.
     func focusTab(_ id: String) {
         activeTabID = id
         switch tabs.first(where: { $0.id == id }) {
-        case .data(let t):     select(database: t.database, relation: t.relation)
-        case .console(let c):  inspector = .database(c.database); selectedDatabase = c.database; selectedRelationID = nil
-        case nil:              break
+        case .data(let t):
+            select(t.connectionId, database: t.database, relation: t.relation)
+        case .console(let c):
+            inspector = .database(connId: c.connectionId, name: c.database)
+            selectedConnectionId = c.connectionId
+            selectedDatabase = c.database
+            selectedRelationID = nil
+        case nil:
+            break
         }
         scheduleConsolePersist()   // remember the selected console for restore
     }
@@ -287,9 +361,12 @@ final class AppModel: ObservableObject {
     func closeTab(_ id: String) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
         let closing = tabs[idx]
+        let connId = closing.connectionId
         tabs.remove(at: idx)
-        Task {
-            if closing.asConsole != nil { await db.closeConsole(id) } else { await db.closeTab(id) }
+        if let db = sessions[connId]?.db {
+            Task {
+                if closing.asConsole != nil { await db.closeConsole(id) } else { await db.closeTab(id) }
+            }
         }
         if closing.asConsole != nil {
             ConsoleStore.remove(id: id)
@@ -304,16 +381,17 @@ final class AppModel: ObservableObject {
     /// Reload the rows for a data tab (e.g. the toolbar refresh button).
     func reloadTab(_ id: String) {
         guard case .data(let tab)? = tabs.first(where: { $0.id == id }) else { return }
-        loadRows(for: id, database: tab.database, relation: tab.relation)
+        loadRows(for: id, connId: tab.connectionId, database: tab.database, relation: tab.relation)
     }
 
-    private func loadRows(for id: String, database: String, relation: Relation) {
+    private func loadRows(for id: String, connId: String, database: String, relation: Relation) {
+        guard let db = sessions[connId]?.db else { return }
         updateDataTab(id) { $0.loading = true; $0.error = nil; $0.columns = []; $0.rows = [] }
         Task {
             do {
                 let cols = try await db.tabColumns(tab: id, database: database, schema: relation.schema, table: relation.name)
                 let set = try await db.tabRows(tab: id, database: database, schema: relation.schema, table: relation.name, limit: 200)
-                columnCache["\(database)|\(relation.schema).\(relation.name)"] = cols
+                mutate(connId) { $0.columnCache["\(database)|\(relation.schema).\(relation.name)"] = cols }
                 updateDataTab(id) {
                     $0.columnInfos = cols
                     $0.columns = set.columns
@@ -331,7 +409,8 @@ final class AppModel: ObservableObject {
     /// On success the row is removed from the tab locally (optimistic).
     func deleteDataTabRow(_ id: String, rowIndex: Int) {
         guard case .data(let tab)? = tabs.first(where: { $0.id == id }),
-              rowIndex >= 0, rowIndex < tab.rows.count else { return }
+              rowIndex >= 0, rowIndex < tab.rows.count,
+              let db = sessions[tab.connectionId]?.db else { return }
         let row = tab.rows[rowIndex]
 
         let pkNames = tab.columnInfos.filter { $0.isPK }.map { $0.name }
@@ -377,7 +456,9 @@ final class AppModel: ObservableObject {
         tabs[idx] = .console(c)
     }
 
-    private var selectionToken: String { "\(selectedDatabase ?? "")|\(selectedRelationID ?? "")" }
+    private var selectionToken: String {
+        "\(selectedConnectionId ?? "")|\(selectedDatabase ?? "")|\(selectedRelationID ?? "")"
+    }
 
     var activeTab: WorkspaceTab? {
         guard let id = activeTabID else { return nil }
@@ -390,23 +471,24 @@ final class AppModel: ObservableObject {
 
     // MARK: Query consoles
 
-    /// Open a new query console bound to `database` (on `connectionId`, defaulting to
-    /// the active connection). Seeds the buffer with `seedSQL` and focuses the tab.
+    /// Open a new query console bound to `database` on `connectionId` (defaulting to
+    /// the selected connection). Seeds the buffer with `seedSQL` and focuses the tab.
     @discardableResult
     func openConsole(connectionId: String? = nil, database: String, seedSQL: String? = nil) -> String {
-        let connId = connectionId ?? activeConn?.id ?? ""
+        let connId = connectionId ?? selectedConnectionId ?? ""
         let id = QueryConsole.newID()
         let sql = seedSQL ?? ""
         let console = QueryConsole(id: id, connectionId: connId, database: database,
                                    title: QueryConsole.deriveTitle(sql: sql), sql: sql)
         tabs.append(.console(console))
         activeTabID = id
-        inspector = .database(database)
+        inspector = .database(connId: connId, name: database)
+        selectedConnectionId = connId
         selectedDatabase = database
         selectedRelationID = nil
         ConsoleStore.writeSQL(id: id, sql: sql)
         flushConsolePersist()
-        prefetchColumns(database: database)
+        prefetchColumns(connId: connId, database: database)
         return id
     }
 
@@ -430,7 +512,7 @@ final class AppModel: ObservableObject {
 
     /// Run and await completion — used by MCP so it can return the results.
     func runConsoleAwait(_ id: String, byClaude: Bool) async {
-        guard let c = console(id) else { return }
+        guard let c = console(id), let db = sessions[c.connectionId]?.db else { return }
         updateConsole(id) { $0.running = true; $0.error = nil; $0.lastRunByClaude = byClaude }
         let start = DispatchTime.now()
         do {
@@ -445,13 +527,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The schema data a console completes against, for `database`.
-    func schemaIndex(for database: String) -> SchemaIndex {
+    /// The schema data a console completes against, for `database` on `connId`.
+    func schemaIndex(connId: String, database: String) -> SchemaIndex {
         var idx = SchemaIndex()
-        if let snap = snapshots[database] {
+        guard let s = sessions[connId] else { return idx }
+        if let snap = s.snapshots[database] {
             idx.tables = snap.relations.map { .init(name: $0.name, schema: $0.schema, kind: $0.kind.rawValue) }
         }
-        for (key, cols) in columnCache where key.hasPrefix("\(database)|") {
+        for (key, cols) in s.columnCache where key.hasPrefix("\(database)|") {
             let qualified = String(key.dropFirst(database.count + 1))   // "schema.table"
             let mapped = cols.map { SchemaIndex.Col(name: $0.name, type: $0.type, pk: $0.isPK, fk: $0.isFK) }
             idx.columnsByTable[qualified.lowercased()] = mapped
@@ -464,16 +547,18 @@ final class AppModel: ObservableObject {
     }
 
     /// Warm the column cache for a database (background) so dot-completion works.
-    private func prefetchColumns(database: String) {
-        guard !prefetchedColumnDBs.contains(database), let snap = snapshots[database] else { return }
-        prefetchedColumnDBs.insert(database)
+    private func prefetchColumns(connId: String, database: String) {
+        guard let s = sessions[connId], !s.prefetchedColumnDBs.contains(database),
+              let snap = s.snapshots[database] else { return }
+        let db = s.db
+        mutate(connId) { $0.prefetchedColumnDBs.insert(database) }
         let targets = Array(snap.relations.prefix(150))   // cap: huge schemas load lazily via selection
         Task {
             for rel in targets {
                 let key = "\(database)|\(rel.schema).\(rel.name)"
-                if columnCache[key] != nil { continue }
+                if sessions[connId]?.columnCache[key] != nil { continue }
                 if let cols = try? await db.columns(database: database, schema: rel.schema, table: rel.name) {
-                    columnCache[key] = cols
+                    mutate(connId) { $0.columnCache[key] = cols }
                 }
             }
         }
@@ -499,17 +584,31 @@ final class AppModel: ObservableObject {
     private func restoreConsoles(for connectionId: String) {
         let (restored, selected) = ConsoleStore.restore(connectionId: connectionId)
         guard !restored.isEmpty else { return }
-        for c in restored { tabs.append(.console(c)) }
-        if let selected { activeTabID = selected }
+        for c in restored where !tabs.contains(where: { $0.id == c.id }) { tabs.append(.console(c)) }
+        if activeTabID == nil, let selected { activeTabID = selected }
     }
 
+    // MARK: Selection helpers
+
+    var selectedSession: ConnState? { selectedConnectionId.flatMap { sessions[$0] } }
+
     var selectedSnapshot: DBSnapshot? {
-        guard let d = selectedDatabase else { return nil }
-        return snapshots[d]
+        guard let d = selectedDatabase, let s = selectedSession else { return nil }
+        return s.snapshots[d]
     }
 
     var selectedRelation: Relation? {
         selectedSnapshot?.relations.first { $0.id == selectedRelationID }
+    }
+}
+
+extension WorkspaceTab {
+    /// The connection a tab belongs to (every tab is connection-scoped).
+    var connectionId: String {
+        switch self {
+        case .data(let t): return t.connectionId
+        case .console(let c): return c.connectionId
+        }
     }
 }
 
