@@ -2,19 +2,32 @@ import SwiftUI
 import AppKit
 import TuskCore
 
+/// A request to open the Manage-connections modal (optionally preselecting a
+/// connection or starting a fresh add).
+struct ManageRequest: Identifiable {
+    let id = UUID()
+    var preselect: String? = nil
+    var addNew: Bool = false
+}
+
 struct Workspace: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var store: ConnectionStore
     @Environment(\.palette) var pal
 
     @AppStorage("tusk.railWidth") private var railWidth: Double = 250
     @AppStorage("tusk.sidebarWidth") private var sidebarWidth: Double = 248
     @AppStorage("tusk.terminalHeight") private var terminalHeight: Double = 300
 
+    @State private var manageRequest: ManageRequest?
+
+    private func openManage(_ req: ManageRequest) { manageRequest = req }
+
     var body: some View {
         VStack(spacing: 0) {
             TitleBar()
             HStack(spacing: 0) {
-                SchemaSidebar(width: CGFloat(sidebarWidth))
+                SchemaSidebar(width: CGFloat(sidebarWidth), openManage: openManage)
                 ResizeHandle(width: $sidebarWidth, range: 200...480, paneOnLeft: true)
                 VStack(spacing: 0) {
                     CenterPane()
@@ -32,6 +45,12 @@ struct Workspace: View {
         }
         .background(pal.surfaceApp)
         .ignoresSafeArea(.container, edges: .top)
+        .sheet(item: $manageRequest) { req in
+            ManageConnectionsModal(preselect: req.preselect, addNew: req.addNew)
+                .environmentObject(model)
+                .environmentObject(store)
+                .environment(\.palette, pal)
+        }
     }
 }
 
@@ -82,6 +101,11 @@ private struct TitleBar: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.palette) var pal
 
+    private var connectedLabel: String {
+        let n = model.connectedCount
+        return "\(n) connected"
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             // Reserve space for the real macOS traffic lights (hiddenTitleBar).
@@ -119,42 +143,15 @@ private struct TitleBar: View {
             }
             .buttonStyle(.plain)
 
-            // Connection switcher / disconnect
-            Menu {
-                Button {
-                    model.refreshSchema()
-                } label: { Label("Refresh schema", systemImage: "arrow.clockwise") }
-                Divider()
-                Button(role: .destructive) {
-                    model.disconnect()
-                } label: { Label("Disconnect", systemImage: "bolt.horizontal.circle") }
-            } label: {
-                HStack(spacing: 8) {
-                    StatusDot(status: model.connectionStatus, size: 7)
-                    Text(model.activeConn?.name ?? "—")
-                        .font(.ui(12))
-                        .foregroundColor(pal.textSecondary)
-                    Text(model.selectedDatabase ?? model.activeConn?.database ?? "")
-                        .font(.mono(11))
-                        .foregroundColor(pal.textFaint)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(pal.textFaint)
+            // Live connection count (matches the mock's plain "N connected" label).
+            HStack(spacing: 6) {
+                if model.connectedCount > 0 {
+                    Circle().fill(pal.success).frame(width: 6, height: 6)
                 }
-                .padding(.horizontal, 10)
-                .frame(height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
-                        .fill(pal.surfaceCard)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
-                        .strokeBorder(pal.borderDefault, lineWidth: 1)
-                )
+                Text(connectedLabel)
+                    .font(.mono(11))
+                    .foregroundColor(pal.textFaint)
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
 
             Button {
                 model.toggleTheme()
@@ -240,20 +237,23 @@ private struct TrafficLightAligner: NSViewRepresentable {
     }
 }
 
-// MARK: - Schema sidebar (live object tree)
+// MARK: - Schema sidebar (multi-connection object tree)
 
 private struct SchemaSidebar: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var store: ConnectionStore
     @Environment(\.palette) var pal
 
     var width: CGFloat = 248
-    @State private var filter = ""
-    @State private var collapsedSchemas: Set<String> = []   // keyed "database.schema"
-    @State private var serverCollapsed = false
+    let openManage: (ManageRequest) -> Void
 
-    /// Schemas (and their relations) for one database, filtered by the search box.
-    private func groups(for database: String) -> [(schema: String, relations: [Relation])] {
-        guard let relations = model.snapshots[database]?.relations else { return [] }
+    @State private var filter = ""
+    @State private var collapsedSchemas: Set<String> = []   // keyed "connId.database.schema"
+    @State private var pendingDelete: Connection?
+
+    /// Schemas (and their relations) for one database of a session, search-filtered.
+    private func groups(_ s: ConnState, _ database: String) -> [(schema: String, relations: [Relation])] {
+        guard let relations = s.snapshots[database]?.relations else { return [] }
         var order: [String] = []
         var map: [String: [Relation]] = [:]
         let q = filter.trimmingCharacters(in: .whitespaces).lowercased()
@@ -265,52 +265,53 @@ private struct SchemaSidebar: View {
         return order.map { ($0, map[$0] ?? []) }
     }
 
-    private var tableCount: Int {
-        model.selectedSnapshot?.relations.filter { $0.kind == .table || $0.kind == .partitioned }.count ?? 0
-    }
-
     var body: some View {
         VStack(spacing: 0) {
+            // Pane header
+            HStack(spacing: 6) {
+                Text("CONNECTIONS")
+                    .font(.ui(10, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundColor(pal.textFaint)
+                Spacer()
+                Button { openManage(ManageRequest(addNew: true)) } label: {
+                    Image(systemName: "plus").font(.system(size: 12, weight: .medium)).foregroundColor(pal.textMuted)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("New connection")
+                Button { openManage(ManageRequest(preselect: model.selectedConnectionId)) } label: {
+                    Image(systemName: "slider.horizontal.3").font(.system(size: 12, weight: .medium)).foregroundColor(pal.textMuted)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("Connection settings")
+            }
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .frame(height: Metrics.toolbarHeight)
+            .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
+
             // Filter
             HStack {
                 TuskTextField(placeholder: "Filter objects…", text: $filter, leadingIcon: "magnifyingglass", mono: false)
             }
             .padding(.horizontal, 10)
-            .frame(height: Metrics.toolbarHeight)
+            .padding(.vertical, 8)
             .overlay(Divider().overlay(pal.borderSubtle), alignment: .bottom)
 
             // Tree
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    Text("EXPLORER")
-                        .font(.ui(10, weight: .semibold))
-                        .tracking(0.6)
-                        .foregroundColor(pal.textFaint)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 10)
-                        .padding(.bottom, 4)
-
-                    if model.loadingSchema {
-                        loadingRow
-                    } else if let err = model.schemaError {
-                        errorRow(err)
+                    if store.connections.isEmpty {
+                        emptyState
                     } else {
-                        // Server node (user@host)
-                        TreeRow(depth: 0, icon: "server.rack", label: model.serverLabel,
-                                trailing: nil, selected: model.inspector == .server,
-                                expandable: true, expanded: !serverCollapsed,
-                                onToggle: { serverCollapsed.toggle() },
-                                onSelect: { model.selectServer() },
-                                onOpen: { serverCollapsed.toggle() })
-
-                        if !serverCollapsed {
-                            ForEach(model.databases, id: \.self) { dbName in
-                                databaseNode(dbName)
-                            }
+                        ForEach(store.connections) { conn in
+                            connectionNode(conn)
                         }
                     }
                 }
-                .padding(.bottom, 8)
+                .padding(.vertical, 6)
             }
 
             // Footer
@@ -318,13 +319,13 @@ private struct SchemaSidebar: View {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
                     .font(.system(size: 11))
                     .foregroundColor(pal.textFaint)
-                Text(model.selectedDatabase ?? "—")
+                Text("\(model.connectedCount) connected")
                     .font(.mono(11))
                     .foregroundColor(pal.textMuted)
-                Text("·").foregroundColor(pal.textFaint)
-                Text("\(tableCount) tables")
-                    .font(.mono(11))
-                    .foregroundColor(pal.textMuted)
+                if let d = model.selectedDatabase {
+                    Text("·").foregroundColor(pal.textFaint)
+                    Text(d).font(.mono(11)).foregroundColor(pal.textMuted).lineLimit(1)
+                }
                 Spacer()
             }
             .padding(.horizontal, 12)
@@ -333,64 +334,146 @@ private struct SchemaSidebar: View {
         }
         .frame(width: width)
         .background(pal.surfacePanel)
+        .confirmationDialog(
+            pendingDelete.map { "Delete “\($0.name.isEmpty ? "Untitled" : $0.name)”?" } ?? "Delete connection?",
+            isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Connection", role: .destructive) {
+                if let c = pendingDelete { deleteConnection(c) }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text("This removes the saved connection and its keychain password. Open tabs for it are closed.")
+        }
+    }
+
+    private func deleteConnection(_ conn: Connection) {
+        if model.session(conn.id) != nil { model.disconnect(conn.id) }
+        store.remove(conn)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "tray").font(.system(size: 20)).foregroundColor(pal.textFaint)
+            Text("No connections yet").font(.ui(12.5, weight: .medium)).foregroundColor(pal.textSecondary)
+            Button { openManage(ManageRequest(addNew: true)) } label: {
+                Text("Add a connection").font(.ui(12)).foregroundColor(pal.accent)
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .padding(.horizontal, 12)
+    }
+
+    // MARK: One connection + (if connected) its databases/schemas/relations
+
+    @ViewBuilder private func connectionNode(_ conn: Connection) -> some View {
+        let session = model.session(conn.id)
+        let status = session?.status ?? "disconnected"
+        let connected = status == "connected"
+        let expanded = connected && (session?.expanded ?? false)
+
+        ConnectionRow(
+            conn: conn,
+            status: status,
+            selected: model.selectedConnectionId == conn.id && isConnectionInspector,
+            expandable: connected,
+            expanded: expanded,
+            onToggle: { if connected { model.toggleConnection(conn.id) } },
+            onSelect: { model.selectConnection(conn.id) },
+            onOpen: {
+                if connected { model.toggleConnection(conn.id) }
+                else if status != "connecting" { connectOrManage(conn) }
+            }
+        )
+        .contextMenu { connectionMenu(conn, connected: connected) }
+
+        if let session, expanded {
+            ForEach(session.databases, id: \.self) { dbName in
+                databaseNode(conn.id, session, dbName)
+            }
+        }
+    }
+
+    private func connectOrManage(_ conn: Connection) {
+        if conn.savePassword { model.connect(store.withPassword(conn)) }
+        else { openManage(ManageRequest(preselect: conn.id)) }
+    }
+
+    @ViewBuilder private func connectionMenu(_ conn: Connection, connected: Bool) -> some View {
+        if connected {
+            Button { model.disconnect(conn.id) } label: { Label("Disconnect", systemImage: "bolt.horizontal.circle") }
+            Button {
+                model.openConsole(connectionId: conn.id, database: conn.database)
+            } label: { Label("New Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
+            Button { model.refreshSchema() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+        } else {
+            Button { connectOrManage(conn) } label: { Label("Connect", systemImage: "bolt.horizontal.circle") }
+        }
+        Divider()
+        Button { openManage(ManageRequest(preselect: conn.id)) } label: { Label("Connection settings…", systemImage: "slider.horizontal.3") }
+        Button(role: .destructive) { pendingDelete = conn } label: { Label("Delete connection…", systemImage: "trash") }
     }
 
     /// One database node plus its (lazily-loaded) schemas and relations.
-    @ViewBuilder private func databaseNode(_ dbName: String) -> some View {
-        let dbExpanded = model.expandedDatabases.contains(dbName)
-        let isActive = dbName == model.activeConn?.database
+    @ViewBuilder private func databaseNode(_ connId: String, _ s: ConnState, _ dbName: String) -> some View {
+        let dbExpanded = s.expandedDatabases.contains(dbName)
 
         TreeRow(depth: 1, icon: "cylinder.split.1x2", label: dbName,
-                trailing: nil, selected: model.inspector == .database(dbName),
-                expandable: true, expanded: dbExpanded, muted: !isActive,
-                onToggle: { model.toggleDatabase(dbName) },
-                onSelect: { model.selectDatabase(dbName) },
-                onOpen: { model.toggleDatabase(dbName) })
+                trailing: nil,
+                selected: model.inspector == .database(connId: connId, name: dbName),
+                expandable: true, expanded: dbExpanded,
+                onToggle: { model.toggleDatabase(connId, dbName) },
+                onSelect: { model.selectDatabase(connId, dbName) },
+                onOpen: { model.toggleDatabase(connId, dbName) })
             .contextMenu {
                 Button {
-                    model.openConsole(database: dbName)
+                    model.openConsole(connectionId: connId, database: dbName)
                 } label: { Label("New Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
             }
 
         if dbExpanded {
-            if model.loadingDatabases.contains(dbName) {
+            if s.loadingDatabases.contains(dbName) {
                 inlineRow(depth: 2) {
                     ProgressView().controlSize(.small).scaleEffect(0.7)
                     Text("Loading…").font(.ui(12)).foregroundColor(pal.textMuted)
                 }
-            } else if let err = model.databaseErrors[dbName] {
+            } else if let err = s.databaseErrors[dbName] {
                 inlineRow(depth: 2) {
                     Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundColor(pal.danger)
                     Text(err).font(.mono(11)).foregroundColor(pal.danger).lineLimit(2)
                 }
             } else {
-                let schemaGroups = groups(for: dbName)
+                let schemaGroups = groups(s, dbName)
                 ForEach(schemaGroups, id: \.schema) { group in
-                    let key = "\(dbName).\(group.schema)"
+                    let key = "\(connId).\(dbName).\(group.schema)"
                     let expanded = !collapsedSchemas.contains(key)
                     TreeRow(depth: 2, icon: "shippingbox", label: group.schema,
                             trailing: "\(group.relations.count)", selected: false,
                             expandable: true, expanded: expanded,
                             onToggle: { toggleSchema(key) },
-                            onSelect: { model.selectDatabase(dbName) },
+                            onSelect: { model.selectDatabase(connId, dbName) },
                             onOpen: { toggleSchema(key) })
 
                     if expanded {
                         ForEach(group.relations) { rel in
                             TreeRow(depth: 3, icon: rel.kind.iconName, label: rel.name,
                                     trailing: (rel.kind == .table || rel.kind == .partitioned) ? Fmt.rows(rel.estRows) : nil,
-                                    selected: model.selectedDatabase == dbName && model.selectedRelationID == rel.id,
+                                    selected: model.selectedConnectionId == connId && model.selectedDatabase == dbName && model.selectedRelationID == rel.id,
                                     expandable: false, expanded: false,
                                     muted: rel.kind == .function,
                                     onToggle: {},
-                                    onSelect: { model.select(database: dbName, relation: rel) },
-                                    onOpen: { model.openTable(database: dbName, relation: rel) })
+                                    onSelect: { model.select(connId, database: dbName, relation: rel) },
+                                    onOpen: { model.openTable(connId, database: dbName, relation: rel) })
                                 .contextMenu {
                                     Button {
-                                        model.openTable(database: dbName, relation: rel)
+                                        model.openTable(connId, database: dbName, relation: rel)
                                     } label: { Label("Open Table", systemImage: "tablecells") }
                                     Button {
-                                        model.openConsole(database: dbName,
+                                        model.openConsole(connectionId: connId, database: dbName,
                                                           seedSQL: "SELECT * FROM \(rel.schema).\(rel.name) LIMIT 100")
                                     } label: { Label("Query Console", systemImage: "chevron.left.forward.slash.chevron.right") }
                                 }
@@ -407,6 +490,11 @@ private struct SchemaSidebar: View {
         }
     }
 
+    private var isConnectionInspector: Bool {
+        if case .connection = model.inspector { return true }
+        return false
+    }
+
     @ViewBuilder private func inlineRow<Content: View>(depth: Int, @ViewBuilder _ content: () -> Content) -> some View {
         HStack(spacing: 6) {
             Spacer().frame(width: CGFloat(depth) * 14 + 24)
@@ -420,21 +508,75 @@ private struct SchemaSidebar: View {
     private func toggleSchema(_ key: String) {
         if collapsedSchemas.contains(key) { collapsedSchemas.remove(key) } else { collapsedSchemas.insert(key) }
     }
+}
 
-    private var loadingRow: some View {
-        HStack(spacing: 8) {
-            ProgressView().controlSize(.small).scaleEffect(0.7)
-            Text("Loading schema…").font(.ui(12)).foregroundColor(pal.textMuted)
-        }
-        .padding(.horizontal, 14).padding(.vertical, 8)
-    }
+// MARK: - Connection row (top-level tree node)
 
-    private func errorRow(_ err: String) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundColor(pal.danger)
-            Text(err).font(.mono(11)).foregroundColor(pal.danger)
+private struct ConnectionRow: View {
+    @Environment(\.palette) var pal
+    let conn: Connection
+    let status: String
+    let selected: Bool
+    let expandable: Bool
+    let expanded: Bool
+    let onToggle: () -> Void
+    let onSelect: () -> Void
+    let onOpen: () -> Void
+
+    @State private var hovering = false
+
+    private var connected: Bool { status == "connected" }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // chevron (only for connected/expandable connections)
+            if expandable {
+                Button(action: onToggle) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(pal.textFaint)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 12)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Spacer().frame(width: 12)
+            }
+
+            if status == "connecting" {
+                ProgressView().controlSize(.small).scaleEffect(0.5).frame(width: 8, height: 8)
+            } else {
+                StatusDot(status: status, size: 8)
+            }
+
+            Image(systemName: "cylinder.split.1x2")
+                .font(.system(size: 13))
+                .foregroundColor(connected ? pal.accent : pal.textFaint)
+                .frame(width: 16)
+
+            Text(conn.name.isEmpty ? "Untitled" : conn.name)
+                .font(.ui(13, weight: .semibold))
+                .foregroundColor(connected ? pal.textPrimary : pal.textMuted)
+                .lineLimit(1)
+
+            Spacer(minLength: 4)
+
+            Text(conn.hostPort)
+                .font(.mono(10.5))
+                .foregroundColor(pal.textFaint)
+                .lineLimit(1)
         }
-        .padding(.horizontal, 14).padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .frame(height: 28)
+        .background(
+            RoundedRectangle(cornerRadius: Metrics.radiusSM, style: .continuous)
+                .fill(selected ? pal.surfaceSelected : (hovering ? pal.surfaceHover : .clear))
+                .padding(.horizontal, 4)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2, perform: onOpen)
+        .onTapGesture(count: 1, perform: onSelect)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -549,6 +691,8 @@ private struct CenterPane: View {
                 ForEach(model.tabs) { tab in
                     TabChip(tab: tab,
                             active: tab.id == model.activeTabID,
+                            connectionName: model.connection(for: tab.connectionId)?.name ?? "",
+                            connectionEnv: model.connection(for: tab.connectionId)?.env ?? "local",
                             onSelect: { model.focusTab(tab.id) },
                             onClose: { model.closeTab(tab.id) })
                 }
@@ -560,6 +704,11 @@ private struct CenterPane: View {
 
     private func contextBar(_ tab: DataTab) -> some View {
         HStack(spacing: 8) {
+            if let conn = model.connection(for: tab.connectionId) {
+                Circle().fill(pal.envColor(conn.env)).frame(width: 7, height: 7)
+                Text(conn.name).font(.mono(11.5)).foregroundColor(pal.textMuted)
+                Text("/").font(.mono(11.5)).foregroundColor(pal.textFaint)
+            }
             Text(tab.relation.schema).font(.mono(11.5)).foregroundColor(pal.textMuted)
             Text("/").font(.mono(11.5)).foregroundColor(pal.textFaint)
             Text(tab.relation.name).font(.mono(11.5, weight: .semibold)).foregroundColor(pal.textPrimary)
@@ -605,8 +754,8 @@ private struct CenterPane: View {
                 .font(.ui(17, weight: .semibold))
                 .foregroundColor(pal.textPrimary)
             VStack(spacing: 4) {
-                Text("Single-click an object in the explorer to inspect it.")
-                Text("Double-click a table to open it in a new tab.")
+                Text("Connect a database from the left to browse it.")
+                Text("Single-click an object to inspect it; double-click a table to open it.")
             }
             .font(.ui(12.5))
             .foregroundColor(pal.textMuted)
@@ -642,6 +791,8 @@ private struct TabChip: View {
     @Environment(\.palette) var pal
     let tab: WorkspaceTab
     let active: Bool
+    let connectionName: String
+    let connectionEnv: String
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -662,6 +813,8 @@ private struct TabChip: View {
 
     var body: some View {
         HStack(spacing: 7) {
+            // Which connection this tab belongs to.
+            Circle().fill(pal.envColor(connectionEnv)).frame(width: 6, height: 6)
             Image(systemName: icon)
                 .font(.system(size: 11))
                 .foregroundColor(active ? pal.accent : pal.textFaint)
@@ -681,7 +834,7 @@ private struct TabChip: View {
         }
         .padding(.horizontal, 12)
         .frame(height: Metrics.tabbarHeight)
-        .frame(maxWidth: 190)
+        .frame(maxWidth: 200)
         .background(active ? pal.surfaceRaised : pal.surfacePanel)
         .overlay(alignment: .top) {
             Rectangle().fill(active ? pal.accent : Color.clear).frame(height: 2)
@@ -690,6 +843,7 @@ private struct TabChip: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .onHover { hovering = $0 }
+        .help(connectionName.isEmpty ? label : "\(connectionName) · \(label)")
     }
 }
 
@@ -746,49 +900,75 @@ private struct InfoRail: View {
     var body: some View {
         Group {
             switch model.inspector {
-            case .server:              connectionInspector
-            case .database(let name):  databaseInspector(name)
-            case .relation:            tableInspector
+            case .none:                          emptyInspector
+            case .connection(let id):            connectionInspector(id)
+            case .database(let connId, let name): databaseInspector(connId, name)
+            case .relation:                      tableInspector
             }
         }
         .frame(width: width)
         .background(pal.surfacePanel)
     }
 
+    private var emptyInspector: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "sidebar.right").font(.system(size: 20)).foregroundColor(pal.textFaint)
+            Text("Select an object")
+                .font(.ui(12.5)).foregroundColor(pal.textMuted)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     // MARK: Connection
 
-    private var connectionInspector: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            railHeader("bolt.horizontal.circle", "Connection")
+    private func connectionInspector(_ id: String) -> some View {
+        let conn = model.connection(for: id)
+        let status = model.status(for: id)
+        return VStack(alignment: .leading, spacing: 0) {
+            railHeader("bolt.horizontal.circle", "Connection", status: status)
             VStack(alignment: .leading, spacing: 10) {
-                infoRow("Name", model.activeConn?.name ?? "—", mono: false)
-                infoRow("Host", model.activeConn?.hostPort ?? "—")
-                infoRow("User", model.activeConn?.user ?? "—")
-                infoRow("SSL", model.activeConn?.sslMode ?? "—")
+                infoRow("Name", conn?.name ?? "—", mono: false)
+                infoRow("Host", conn?.hostPort ?? "—")
+                infoRow("User", conn?.user ?? "—")
+                infoRow("SSL", conn?.sslMode ?? "—")
+                infoRow("Status", status.capitalized, mono: false)
             }
             .padding(14)
-            sectionLabel("SERVER")
-            HStack(spacing: 8) {
-                stat("\(model.databases.count)", "databases")
+            if let err = model.connectErrors[id] {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundColor(pal.danger)
+                    Text(err).font(.mono(11)).foregroundColor(pal.danger).lineLimit(3)
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 10)
             }
-            .padding(.horizontal, 14)
+            if let s = model.session(id) {
+                sectionLabel("SERVER")
+                HStack(spacing: 8) {
+                    stat("\(s.databases.count)", "databases")
+                }
+                .padding(.horizontal, 14)
+            }
             Spacer()
         }
     }
 
     // MARK: Database
 
-    private func databaseInspector(_ name: String) -> some View {
-        let snap = model.snapshots[name]
+    private func databaseInspector(_ connId: String, _ name: String) -> some View {
+        let s = model.session(connId)
+        let snap = s?.snapshots[name]
         return VStack(alignment: .leading, spacing: 0) {
-            railHeader("cylinder.split.1x2", "Database")
+            railHeader("cylinder.split.1x2", "Database", status: model.status(for: connId))
             VStack(alignment: .leading, spacing: 10) {
                 infoRow("Name", name)
-                infoRow("Server", model.activeConn?.hostPort ?? "—")
+                infoRow("Connection", model.connection(for: connId)?.name ?? "—", mono: false)
+                infoRow("Server", model.connection(for: connId)?.hostPort ?? "—")
             }
             .padding(14)
             sectionLabel("OVERVIEW")
-            if snap == nil && model.loadingDatabases.contains(name) {
+            if snap == nil && (s?.loadingDatabases.contains(name) ?? false) {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small).scaleEffect(0.7)
                     Text("Loading…").font(.ui(12)).foregroundColor(pal.textMuted)
@@ -810,7 +990,7 @@ private struct InfoRail: View {
 
     private var tableInspector: some View {
         VStack(alignment: .leading, spacing: 0) {
-            railHeader("tablecells", "Table")
+            railHeader("tablecells", "Table", status: model.selectedConnectionId.map { model.status(for: $0) } ?? "disconnected")
             if let rel = model.selectedRelation {
                 VStack(alignment: .leading, spacing: 10) {
                     infoRow("Schema", rel.schema)
@@ -853,12 +1033,12 @@ private struct InfoRail: View {
 
     // MARK: Building blocks
 
-    private func railHeader(_ icon: String, _ title: String) -> some View {
+    private func railHeader(_ icon: String, _ title: String, status: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon).font(.system(size: 14)).foregroundColor(pal.textMuted)
             Text(title).font(.ui(13, weight: .semibold)).foregroundColor(pal.textPrimary)
             Spacer()
-            StatusDot(status: model.connectionStatus, size: 7)
+            StatusDot(status: status, size: 7)
         }
         .padding(.horizontal, 14)
         .frame(height: Metrics.toolbarHeight)

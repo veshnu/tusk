@@ -2,28 +2,25 @@ import Foundation
 import TuskCore
 
 /// Backs the MCP tools with Tusk's live state: all configured connections (from
-/// `ConnectionStore`) and the currently-open connection's databases/schema (from
-/// `AppModel`). Tusk opens one connection at a time, so table/column lookups apply
-/// to the active connection; other connections list but can't be drilled into until
-/// opened in the app.
+/// `ConnectionStore`) and the databases/schema of any *currently-connected* one
+/// (from `AppModel.sessions`). Several connections can be live at once; each
+/// table/column lookup routes to the owning connection's libpq manager. Connections
+/// that aren't connected list but can't be drilled into until opened in the app.
 final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
-    private let db: Database
     private weak var model: AppModel?
     private weak var store: ConnectionStore?
 
     init(model: AppModel, store: ConnectionStore) {
-        self.db = model.db
         self.model = model
         self.store = store
     }
 
     func listConnections() async -> [ConnectionInfo] {
         await MainActor.run {
-            let activeId = model?.activeConn?.id
-            return (store?.connections ?? []).map { c in
+            (store?.connections ?? []).map { c in
                 ConnectionInfo(id: c.id, name: c.name.isEmpty ? "Untitled" : c.name,
                                host: c.host, port: c.port, user: c.user, database: c.database,
-                               env: c.env, status: c.id == activeId ? "connected" : "disconnected")
+                               env: c.env, status: model?.isConnected(c.id) == true ? "connected" : "disconnected")
             }
         }
     }
@@ -31,13 +28,12 @@ final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
     func listDatabases(connectionId: String) async throws -> [DatabaseInfo] {
         // Reflect Tusk's known state — no fresh server round-trip.
         let known: [String]? = await MainActor.run {
-            guard model?.activeConn?.id == connectionId else { return nil }
-            return model?.databases ?? []
+            model?.isConnected(connectionId) == true ? model?.session(connectionId)?.databases : nil
         }
         if let known {
             return known.map { DatabaseInfo(id: TuskID.database(connectionId: connectionId, name: $0), name: $0, connectionId: connectionId) }
         }
-        // Not the active connection: we only know its configured default database.
+        // Not connected: we only know its configured default database.
         let configured: Connection? = await MainActor.run { store?.connections.first { $0.id == connectionId } }
         guard let cfg = configured else { throw MCPError.notFound("connection \(connectionId)") }
         return [DatabaseInfo(id: TuskID.database(connectionId: connectionId, name: cfg.database), name: cfg.database, connectionId: connectionId)]
@@ -45,9 +41,9 @@ final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
 
     func listTables(databaseId: String) async throws -> [TableInfo] {
         let (connId, dbName) = try TuskID.splitDatabase(databaseId)
-        try await requireActive(connId)
+        let db = try await requireConnected(connId)
         // Prefer the schema Tusk already loaded; otherwise load it once.
-        if let cached = await MainActor.run(body: { model?.snapshots[dbName] }) {
+        if let cached = await MainActor.run(body: { model?.session(connId)?.snapshots[dbName] }) {
             return cached.relations.map(Self.tableInfo)
         }
         let snap = try await db.snapshot(database: dbName)
@@ -56,7 +52,7 @@ final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
 
     func describeTable(databaseId: String, tableId: String) async throws -> [ColumnInfo] {
         let (connId, dbName) = try TuskID.splitDatabase(databaseId)
-        try await requireActive(connId)
+        let db = try await requireConnected(connId)
         let (schema, table) = try TuskID.splitTable(tableId)
         return try await db.columns(database: dbName, schema: schema, table: table)
     }
@@ -65,7 +61,7 @@ final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
 
     func createQueryConsole(databaseId: String, sql: String?) async throws -> String {
         let (connId, dbName) = try TuskID.splitDatabase(databaseId)
-        try await requireActive(connId)
+        _ = try await requireConnected(connId)
         let id = await MainActor.run { model?.openConsole(connectionId: connId, database: dbName, seedSQL: sql) }
         guard let id else { throw MCPError.notConnected("Tusk is not running.") }
         return id
@@ -122,11 +118,14 @@ final class AppTuskProvider: TuskStateProviding, @unchecked Sendable {
 
     // MARK: Helpers
 
-    private func requireActive(_ connectionId: String) async throws {
-        let isActive = await MainActor.run { model?.activeConn?.id == connectionId }
-        guard isActive else {
+    /// Ensure the connection is currently connected and return its libpq manager.
+    @discardableResult
+    private func requireConnected(_ connectionId: String) async throws -> Database {
+        let db = await MainActor.run { model?.isConnected(connectionId) == true ? model?.db(for: connectionId) : nil }
+        guard let db else {
             throw MCPError.notConnected("Open this connection in Tusk to browse its tables.")
         }
+        return db
     }
 
     private static func tableInfo(_ r: Relation) -> TableInfo {

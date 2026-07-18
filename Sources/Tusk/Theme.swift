@@ -138,11 +138,12 @@ struct Palette {
                  table: Color(hex: 0x5C2699), identifier: textPrimary, oper: textSecondary, punct: textMuted)
     }
 
-    // Env badge color (production/staging/local)
+    // Env badge color (production/staging/dev/local)
     func envColor(_ env: String) -> Color {
         switch env.lowercased() {
         case "production", "prod": return danger
         case "staging", "stg": return warning
+        case "dev", "development": return success
         default: return textMuted
         }
     }
