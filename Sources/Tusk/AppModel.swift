@@ -377,6 +377,28 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Close several tabs at once (tab-bar context menu). If the active tab is among
+    /// them, `next` takes focus up front so closing doesn't hop focus tab by tab.
+    func closeTabs(_ ids: [String], focusing next: String? = nil) {
+        if let active = activeTabID, ids.contains(active) {
+            if let next { focusTab(next) } else { activeTabID = nil }
+        }
+        ids.forEach(closeTab)
+    }
+
+    func closeAllTabs() {
+        closeTabs(tabs.map(\.id))
+    }
+
+    func closeOtherTabs(_ id: String) {
+        closeTabs(tabs.map(\.id).filter { $0 != id }, focusing: id)
+    }
+
+    func closeTabsToRight(of id: String) {
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        closeTabs(tabs[(idx + 1)...].map(\.id), focusing: id)
+    }
+
     /// Reload the rows for a data tab (e.g. the toolbar refresh button).
     func reloadTab(_ id: String) {
         guard case .data(let tab)? = tabs.first(where: { $0.id == id }) else { return }

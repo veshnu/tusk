@@ -712,6 +712,15 @@ private struct CenterPane: View {
                             connectionEnv: model.connection(for: tab.connectionId)?.env ?? "local",
                             onSelect: { model.focusTab(tab.id) },
                             onClose: { model.closeTab(tab.id) })
+                        .contextMenu {
+                            Button("Close Tab") { model.closeTab(tab.id) }
+                            Button("Close Other Tabs") { model.closeOtherTabs(tab.id) }
+                                .disabled(model.tabs.count < 2)
+                            Button("Close Tabs to the Right") { model.closeTabsToRight(of: tab.id) }
+                                .disabled(model.tabs.last?.id == tab.id)
+                            Divider()
+                            Button("Close All Tabs") { model.closeAllTabs() }
+                        }
                 }
             }
         }
